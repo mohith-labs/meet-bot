@@ -31,6 +31,14 @@ export class BotsService {
    */
   private readonly meetingStartTimes = new Map<string, Date>();
 
+  /**
+   * Tracks the absoluteStartTime (epoch ms) for the current active segment
+   * per meeting. Keyed by meetingId. When a new interim caption arrives for
+   * the first time (or after a final), we record Date.now(). Subsequent
+   * interim updates for the same speaker reuse this value.
+   */
+  private readonly activeSegmentStartTimes = new Map<string, number>();
+
   constructor(
     @InjectRepository(Meeting)
     private readonly meetingsRepository: Repository<Meeting>,
@@ -222,20 +230,31 @@ export class BotsService {
     meetingKey: string,
     caption: CaptionEvent,
   ): Promise<void> {
+    // Track absoluteStartTime: record Date.now() when the first interim
+    // arrives for a segment; reuse it for subsequent interims and the final.
+    if (!this.activeSegmentStartTimes.has(meetingId)) {
+      this.activeSegmentStartTimes.set(meetingId, Date.now());
+    }
+    const absoluteStartTime = this.activeSegmentStartTimes.get(meetingId)!;
+
     // Only persist final captions to the database
     if (!caption.isFinal) {
       // Broadcast interim captions to WebSocket (live preview), but don't save
       this.broadcastTranscript(meetingId, meetingKey, {
-        id: `interim-${Date.now()}`,
+        id: `interim-${absoluteStartTime}`,
         text: caption.text,
         speaker: caption.speaker,
         language: 'en',
         startTime: 0,
         endTime: 0,
-        completed: false,
+        absoluteStartTime,
+        isFinal: false,
       });
       return;
     }
+
+    // Final caption — clear the tracked start time so the next segment gets a fresh one
+    this.activeSegmentStartTimes.delete(meetingId);
 
     // Calculate relative times from meeting start
     const meetingStart = this.meetingStartTimes.get(meetingId);
@@ -245,8 +264,10 @@ export class BotsService {
     let endTime = 0;
     if (meetingStart) {
       endTime = (now.getTime() - meetingStart.getTime()) / 1000;
-      // Approximate start time: assume caption spans ~3 seconds before "now"
-      startTime = Math.max(0, endTime - 3);
+      startTime = Math.max(
+        0,
+        (absoluteStartTime - meetingStart.getTime()) / 1000,
+      );
     }
 
     try {
@@ -257,7 +278,7 @@ export class BotsService {
         language: 'en',
         startTime,
         endTime,
-        absoluteStartTime: new Date(now.getTime() - 3000),
+        absoluteStartTime: new Date(absoluteStartTime),
         absoluteEndTime: now,
         completed: true,
       });
@@ -276,7 +297,8 @@ export class BotsService {
         language: saved.language,
         startTime: saved.startTime,
         endTime: saved.endTime,
-        completed: true,
+        absoluteStartTime,
+        isFinal: true,
       });
     } catch (error) {
       this.logger.error(
@@ -300,6 +322,7 @@ export class BotsService {
       });
 
       this.meetingStartTimes.delete(meetingId);
+      this.activeSegmentStartTimes.delete(meetingId);
       this.broadcastStatus(meetingId, meetingKey, MeetingStatus.COMPLETED);
     } catch (error) {
       this.logger.error(
@@ -357,6 +380,7 @@ export class BotsService {
     await this.meetingsRepository.save(meeting);
 
     this.meetingStartTimes.delete(meeting.id);
+    this.activeSegmentStartTimes.delete(meeting.id);
     this.broadcastStatus(meeting.id, meetingKey, MeetingStatus.COMPLETED);
 
     this.logger.log(`Bot stopped for meeting ${platform}/${nativeMeetingId}`);
@@ -469,14 +493,24 @@ export class BotsService {
       language: string;
       startTime: number;
       endTime: number;
-      completed: boolean;
+      absoluteStartTime: number;
+      isFinal: boolean;
     },
   ): void {
     try {
-      // Broadcast to subscribers by meeting UUID
-      this.transcriptGateway.broadcastTranscriptMutable(meetingId, segment);
-      // Also broadcast to subscribers by platform/nativeMeetingId key
-      this.transcriptGateway.broadcastTranscriptMutable(meetingKey, segment);
+      if (segment.isFinal) {
+        const finalSegment = segment as typeof segment & { isFinal: true };
+        // Broadcast to subscribers by meeting UUID
+        this.transcriptGateway.broadcastTranscriptFinal(meetingId, finalSegment);
+        // Also broadcast to subscribers by platform/nativeMeetingId key
+        this.transcriptGateway.broadcastTranscriptFinal(meetingKey, finalSegment);
+      } else {
+        const mutableSegment = segment as typeof segment & { isFinal: false };
+        // Broadcast to subscribers by meeting UUID
+        this.transcriptGateway.broadcastTranscriptMutable(meetingId, mutableSegment);
+        // Also broadcast to subscribers by platform/nativeMeetingId key
+        this.transcriptGateway.broadcastTranscriptMutable(meetingKey, mutableSegment);
+      }
     } catch (error) {
       this.logger.warn(`Failed to broadcast transcript: ${error.message}`);
     }
@@ -496,6 +530,7 @@ export class BotsService {
       if (status === MeetingStatus.COMPLETED || status === MeetingStatus.FAILED) {
         update.endTime = new Date();
         this.meetingStartTimes.delete(meetingId);
+        this.activeSegmentStartTimes.delete(meetingId);
       }
       await this.meetingsRepository.update(meetingId, update);
       this.broadcastStatus(meetingId, meetingKey, status);

@@ -28,7 +28,7 @@ export interface GroupedTranscript {
 const SPEAKER_GROUP_GAP_MS = 3000; // 3 seconds gap starts new group
 
 export function useLiveTranscripts(meetingId: string | null) {
-  const [segments, setSegments] = useState<Map<number, TranscriptEntry>>(
+  const [segments, setSegments] = useState<Map<string, TranscriptEntry>>(
     new Map()
   );
   const [meetingStatus, setMeetingStatus] = useState<string | null>(null);
@@ -40,7 +40,8 @@ export function useLiveTranscripts(meetingId: string | null) {
 
       setSegments((prev) => {
         const next = new Map(prev);
-        const key = data.segment.absoluteStartTime;
+        // Use segment id as key for reliable deduplication (Issue 3)
+        const key = data.segment.id || String(data.segment.absoluteStartTime) || String(Date.now());
         const existing = next.get(key);
 
         // Don't overwrite final segments with mutable ones
@@ -53,7 +54,7 @@ export function useLiveTranscripts(meetingId: string | null) {
           startTime: data.segment.startTime,
           endTime: data.segment.endTime,
           absoluteStartTime: data.segment.absoluteStartTime,
-          isFinal: false,
+          isFinal: data.segment.isFinal ?? false, // Issue 4: read from data
         });
 
         return next;
@@ -72,7 +73,8 @@ export function useLiveTranscripts(meetingId: string | null) {
 
       setSegments((prev) => {
         const next = new Map(prev);
-        const key = data.segment.absoluteStartTime;
+        // Use segment id as key for reliable deduplication (Issue 3)
+        const key = data.segment.id || String(data.segment.absoluteStartTime) || String(Date.now());
 
         next.set(key, {
           id: data.segment.id,
@@ -103,6 +105,12 @@ export function useLiveTranscripts(meetingId: string | null) {
     onTranscriptFinal: handleTranscriptFinal,
     onMeetingStatus: handleMeetingStatus,
     autoConnect: !!meetingId,
+    onConnect: () => {
+      // Re-subscribe on (re)connect (Issue 5)
+      if (meetingId) {
+        subscribe(meetingId);
+      }
+    },
   });
 
   // Sort segments by absoluteStartTime

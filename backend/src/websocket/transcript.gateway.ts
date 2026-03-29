@@ -156,8 +156,8 @@ export class TranscriptGateway
   }
 
   /**
-   * Broadcast a mutable transcript event to all clients subscribed to a meeting.
-   * Called internally by the bot service when a new transcript segment arrives.
+   * Broadcast a mutable (interim) transcript event to all clients subscribed to a meeting.
+   * Called internally by the bot service when a non-final transcript segment arrives.
    */
   broadcastTranscriptMutable(
     meetingKey: string,
@@ -168,10 +168,35 @@ export class TranscriptGateway
       language: string;
       startTime: number;
       endTime: number;
-      completed: boolean;
+      absoluteStartTime: number;
+      isFinal: false;
     },
   ) {
     this.server.to(`meeting:${meetingKey}`).emit('transcript.mutable', {
+      meetingId: meetingKey,
+      segment,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Broadcast a final transcript event to all clients subscribed to a meeting.
+   * Called internally by the bot service when a finalized transcript segment arrives.
+   */
+  broadcastTranscriptFinal(
+    meetingKey: string,
+    segment: {
+      id: string;
+      text: string;
+      speaker: string;
+      language: string;
+      startTime: number;
+      endTime: number;
+      absoluteStartTime: number;
+      isFinal: true;
+    },
+  ) {
+    this.server.to(`meeting:${meetingKey}`).emit('transcript.final', {
       meetingId: meetingKey,
       segment,
       timestamp: new Date().toISOString(),

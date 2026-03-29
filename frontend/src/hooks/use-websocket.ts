@@ -64,19 +64,16 @@ export interface BotStatusData {
 }
 
 export function useWebSocket(options: UseWebSocketOptions = {}) {
-  const {
-    onTranscriptMutable,
-    onTranscriptFinal,
-    onMeetingStatus,
-    onBotStatus,
-    onConnect,
-    onDisconnect,
-    autoConnect = true,
-  } = options;
+  const { autoConnect = true } = options;
+
+  // Store latest callbacks in a ref to avoid reconnection loops (Issue 2)
+  const callbacksRef = useRef(options);
+  callbacksRef.current = options;
 
   const socketRef = useRef<Socket | null>(null);
   const reconnectAttemptRef = useRef(0);
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingSubscriptionsRef = useRef<Set<string>>(new Set());
   const [isConnected, setIsConnected] = useState(false);
 
   const cleanup = useCallback(() => {
@@ -109,7 +106,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     socket.on("connect", () => {
       setIsConnected(true);
       reconnectAttemptRef.current = 0;
-      onConnect?.();
+      callbacksRef.current.onConnect?.();
+
+      // Flush pending subscriptions (Issue 1)
+      pendingSubscriptionsRef.current.forEach((meetingId) => {
+        socket.emit("subscribe", { meetingId });
+      });
+      pendingSubscriptionsRef.current.clear();
 
       // Start ping/pong keepalive
       pingIntervalRef.current = setInterval(() => {
@@ -121,7 +124,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
     socket.on("disconnect", () => {
       setIsConnected(false);
-      onDisconnect?.();
+      callbacksRef.current.onDisconnect?.();
 
       if (pingIntervalRef.current) {
         clearInterval(pingIntervalRef.current);
@@ -157,38 +160,33 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     });
 
     socket.on("transcript.mutable", (data: TranscriptMutableData) => {
-      onTranscriptMutable?.(data);
+      callbacksRef.current.onTranscriptMutable?.(data);
     });
 
     socket.on("transcript.final", (data: TranscriptFinalData) => {
-      onTranscriptFinal?.(data);
+      callbacksRef.current.onTranscriptFinal?.(data);
     });
 
     socket.on("meeting.status", (data: MeetingStatusData) => {
-      onMeetingStatus?.(data);
+      callbacksRef.current.onMeetingStatus?.(data);
     });
 
     socket.on("bot.status", (data: BotStatusData) => {
-      onBotStatus?.(data);
+      callbacksRef.current.onBotStatus?.(data);
     });
 
     socket.on("pong", () => {
       // Keepalive acknowledged
     });
-  }, [
-    cleanup,
-    onConnect,
-    onDisconnect,
-    onTranscriptMutable,
-    onTranscriptFinal,
-    onMeetingStatus,
-    onBotStatus,
-  ]);
+  }, [cleanup]);
 
   const subscribe = useCallback(
     (meetingId: string) => {
       if (socketRef.current?.connected) {
         socketRef.current.emit("subscribe", { meetingId });
+      } else {
+        // Queue for when connection is established (Issue 1)
+        pendingSubscriptionsRef.current.add(meetingId);
       }
     },
     []
@@ -196,6 +194,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
   const unsubscribe = useCallback(
     (meetingId: string) => {
+      pendingSubscriptionsRef.current.delete(meetingId);
       if (socketRef.current?.connected) {
         socketRef.current.emit("unsubscribe", { meetingId });
       }
