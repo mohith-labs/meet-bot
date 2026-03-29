@@ -30,15 +30,6 @@ services:
     depends_on:
       - backend
 
-  auth-generator:
-    image: node:20-slim
-    working_dir: /app
-    volumes:
-      - ./backend:/app
-      - backend-data:/app/data
-    environment:
-      - DISPLAY=:99
-    command: ["bash", "-c", "apt-get update && apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1 libgtk-3-0 libx11-xcb1 fonts-liberation wget ca-certificates procps && npm ci && npx playwright install chromium && Xvfb :99 -screen 0 1280x720x24 & sleep 2 && x11vnc -display :99 -nopw -forever -shared & sleep 1 && websockify --web /usr/share/novnc 6080 localhost:5900 & sleep 1 && echo '====== Open http://YOUR_VPS_IP:6080/vnc.html to complete 2FA ======' && sleep 3 && node scripts/generate-auth.js && cp -f /app/auth.json /app/data/auth.json 2>/dev/null; echo 'Done! auth.json generated. Press Ctrl+C to stop.' && sleep infinity"]
 
 volumes:
   backend-data:
