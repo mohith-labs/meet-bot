@@ -18,7 +18,6 @@ services:
       - REGISTRATION_ENABLED=${REGISTRATION_ENABLED}
     volumes:
       - backend-data:/app/data
-      - ./backend/auth.json:/app/data/auth.json
 
   frontend:
     build:
