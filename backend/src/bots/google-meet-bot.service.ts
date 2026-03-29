@@ -97,9 +97,10 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       const contextOptions: Record<string, any> = {
         viewport: { width: 1280, height: 720 },
         userAgent:
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         permissions: ['microphone', 'camera'],
+        locale: 'en-US',
       };
 
       if (authPath) {
@@ -196,9 +197,18 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     emitter.emit('status', 'joining');
     this.logger.log(`Navigating to ${meetingUrl}`);
     await page.goto(meetingUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30_000,
+      waitUntil: 'networkidle',
+      timeout: 60_000,
     });
+
+    // Wait for page to fully render (VPS can be slow)
+    await page.waitForTimeout(5000);
+
+    // Log current URL + page title for debugging
+    this.logger.log(`Page loaded — URL: ${page.url()}, Title: ${await page.title()}`);
+
+    // Handle Google "sign in" redirect or "browser not supported" pages
+    await this.handleBlockingPages(page, meetingUrl);
 
     // Step 2: Turn off mic and camera on the pre-join page
     await this.turnOffMediaDevices(page);
@@ -293,6 +303,81 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       } catch {
         // Ignore
       }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Handle blocking pages (browser not supported, sign-in redirect, etc.)
+  // ---------------------------------------------------------------------------
+
+  private async handleBlockingPages(
+    page: Page,
+    meetingUrl: string,
+  ): Promise<void> {
+    const url = page.url();
+    const bodyText = await page.evaluate(() =>
+      document.body?.innerText?.substring(0, 500) || '',
+    ).catch(() => '');
+
+    this.logger.debug(`Current URL: ${url}`);
+    this.logger.debug(`Page text preview: ${bodyText.substring(0, 200)}`);
+
+    // Google may redirect to accounts.google.com for sign-in
+    if (url.includes('accounts.google.com')) {
+      this.logger.warn('Redirected to Google sign-in. Auth state may be expired.');
+      this.logger.warn('Re-run: npm run gen:auth to refresh the session.');
+      // Try navigating back to the meeting URL
+      await page.goto(meetingUrl, { waitUntil: 'networkidle', timeout: 30_000 });
+      await page.waitForTimeout(3000);
+    }
+
+    // "You can't join this video call" or "Check your meeting code"
+    const lowerBody = bodyText.toLowerCase();
+    if (
+      lowerBody.includes("can't join") ||
+      lowerBody.includes('check your meeting code') ||
+      lowerBody.includes('meeting not found') ||
+      lowerBody.includes('invalid meeting')
+    ) {
+      throw new Error(`Meeting not accessible: ${bodyText.substring(0, 100)}`);
+    }
+
+    // "Your browser doesn't support" or "Switch to Chrome"
+    if (
+      lowerBody.includes("browser doesn't support") ||
+      lowerBody.includes('not supported') ||
+      lowerBody.includes('switch to chrome') ||
+      lowerBody.includes('download chrome')
+    ) {
+      this.logger.warn(
+        'Google Meet says browser is not supported. Attempting to continue anyway...',
+      );
+      // Try clicking "Join anyway" or similar
+      const joinAnywayTexts = ['Join anyway', 'Continue anyway', 'Use this browser'];
+      for (const text of joinAnywayTexts) {
+        try {
+          const btn = page.getByRole('button', { name: text, exact: false });
+          if ((await btn.count()) > 0) {
+            await btn.first().click({ timeout: 3000 });
+            this.logger.log(`Clicked "${text}" to bypass browser check`);
+            await page.waitForTimeout(2000);
+            return;
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    // "Get a link you can share" — we're on the Meet home page, not the meeting
+    if (
+      lowerBody.includes('get a link you can share') ||
+      lowerBody.includes('new meeting') ||
+      lowerBody.includes('start an instant meeting')
+    ) {
+      this.logger.warn('Landed on Google Meet home page instead of meeting. Retrying navigation...');
+      await page.goto(meetingUrl, { waitUntil: 'networkidle', timeout: 30_000 });
+      await page.waitForTimeout(3000);
     }
   }
 
@@ -445,6 +530,34 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     });
 
     if (!clicked) {
+      // Dump debug info to logs so we can see what the page actually shows
+      const debugInfo = await page.evaluate(() => {
+        const allButtons = Array.from(
+          document.querySelectorAll('button, [role="button"]'),
+        );
+        return {
+          url: window.location.href,
+          title: document.title,
+          buttons: allButtons
+            .map((b) => ({
+              text: b.textContent?.trim().substring(0, 80),
+              ariaLabel: b.getAttribute('aria-label'),
+              visible: (b as HTMLElement).offsetParent !== null,
+            }))
+            .filter((b) => b.visible)
+            .slice(0, 20),
+          bodyPreview: document.body?.innerText?.substring(0, 300),
+        };
+      }).catch(() => ({ url: 'unknown', title: 'unknown', buttons: [], bodyPreview: '' }));
+
+      this.logger.error(
+        `Join button not found. Page debug info:\n` +
+        `  URL: ${debugInfo.url}\n` +
+        `  Title: ${debugInfo.title}\n` +
+        `  Visible buttons: ${JSON.stringify(debugInfo.buttons, null, 2)}\n` +
+        `  Body preview: ${debugInfo.bodyPreview}`,
+      );
+
       throw new Error(
         'Could not find the join button. The meeting page layout may have changed.',
       );
