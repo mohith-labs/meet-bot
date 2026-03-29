@@ -547,74 +547,87 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     // Dismiss any overlays that might block keyboard shortcuts
     await this.dismissOverlays(page);
 
+    // Dismiss any overlay that might block keyboard shortcut delivery
+    const overlay = page.locator('div[data-disable-esc-to-close="true"]');
+    for (let i = 0; i < 8; i++) {
+      if (!(await overlay.isVisible().catch(() => false))) break;
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(200);
+    }
+
     // Try Shift+C keyboard shortcut (Recall.ai's primary approach)
     const maxRetries = 10;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
+      this.logger.debug(
+        `Pressing Shift+C (attempt ${attempt + 1}/${maxRetries})`,
+      );
+
+      await page.keyboard.down('Shift');
+      await page.keyboard.press('c');
+      await page.keyboard.up('Shift');
+
+      // Check if captions region appeared
+      const captionRegion = page.locator(
+        '[role="region"][aria-label*="Captions" i]',
+      );
       try {
-        // Press Shift+C to toggle captions
-        await page.keyboard.down('Shift');
-        await page.keyboard.press('KeyC');
-        await page.keyboard.up('Shift');
-
-        this.logger.debug(
-          `Pressed Shift+C (attempt ${attempt + 1}/${maxRetries})`,
-        );
-
-        // Wait a moment then check if captions region appeared
-        await page.waitForTimeout(1500);
-
-        const captionRegion = page.locator(
-          '[role="region"][aria-label*="Captions" i], [role="region"][aria-label*="Caption" i]',
-        );
-
-        if ((await captionRegion.count()) > 0) {
+        await captionRegion.waitFor({ timeout: 800 });
+        if (await captionRegion.isVisible().catch(() => false)) {
           this.logger.log(
             `Captions enabled via Shift+C on attempt ${attempt + 1}`,
           );
           return;
         }
-
-        // Also check for caption container elements
-        const captionContainer = page.locator(
-          '[jscontroller][aria-live="polite"], .a4cQT',
-        );
-        if ((await captionContainer.count()) > 0) {
-          this.logger.log(
-            `Caption container detected on attempt ${attempt + 1}`,
-          );
-          return;
-        }
       } catch {
-        // Retry
+        // Not visible yet
       }
 
-      await page.waitForTimeout(500);
+      // Also check if "Turn off captions" button is visible (means captions are ON)
+      const ccOffBtn = page.locator('button[aria-label*="Turn off captions" i]');
+      if (await ccOffBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+        this.logger.log(
+          'Captions confirmed ON (Turn off captions button visible)',
+        );
+        return;
+      }
+
+      await page.waitForTimeout(600);
     }
 
-    // Fallback: try clicking the captions button directly
+    // Fallback: move mouse to bottom to trigger toolbar, then click CC button
     this.logger.warn(
-      'Shift+C did not enable captions, trying button click fallback',
+      'Shift+C did not enable captions, trying button click fallback...',
     );
+    await page.mouse.move(500, 700);
+    await page.waitForTimeout(300);
 
-    const captionButtonSelectors = [
-      'button[aria-label*="Turn on captions" i]',
-      'button[aria-label*="captions" i]',
-      'button[data-tooltip*="captions" i]',
-      'button[aria-label*="subtitle" i]',
-    ];
-
-    for (const selector of captionButtonSelectors) {
-      try {
-        const btn = page.locator(selector).first();
-        if ((await btn.count()) > 0) {
-          await btn.click({ timeout: 3000 });
-          this.logger.log(`Clicked caption button: ${selector}`);
-          await page.waitForTimeout(1500);
-          return;
-        }
-      } catch {
-        continue;
+    const ccButton = page.locator('button[aria-label*="Turn on captions" i]');
+    try {
+      await ccButton.waitFor({ state: 'visible', timeout: 4000 });
+      await ccButton.click();
+      // Verify captions turned on
+      const captionRegion = page.locator(
+        '[role="region"][aria-label*="Captions" i]',
+      );
+      if (
+        await captionRegion
+          .waitFor({ timeout: 5000 })
+          .then(() => true)
+          .catch(() => false)
+      ) {
+        this.logger.log('Captions enabled via CC button fallback');
+        return;
       }
+    } catch {
+      this.logger.warn('CC button fallback also failed');
+    }
+
+    // Debug: log visible regions
+    try {
+      const regions = await page.locator('[role="region"]').allTextContents();
+      this.logger.warn(`Visible regions: ${JSON.stringify(regions)}`);
+    } catch {
+      // Ignore
     }
 
     this.logger.warn(
@@ -727,73 +740,98 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       this.logger.warn(`Failed to expose onCaption function: ${err.message}`);
     }
 
-    // Inject MutationObserver into the page (Recall.ai approach)
+    // Wait for the [aria-live] caption region to appear (Recall.ai approach)
+    // This confirms that captions are actually rendering in the DOM
+    this.logger.log('Waiting for caption [aria-live] region to appear...');
+    try {
+      await page.waitForSelector('[aria-live]', { timeout: 30_000 });
+      this.logger.log('Found [aria-live] element, waiting for caption text...');
+
+      // Wait until at least one aria-live element has text content
+      await page.waitForFunction(
+        () => {
+          const liveElements = Array.from(
+            document.querySelectorAll<HTMLElement>('[aria-live]'),
+          );
+          return liveElements.some(
+            (el) => el.textContent && el.textContent.trim().length > 0,
+          );
+        },
+        { timeout: 60_000 },
+      );
+      this.logger.log('Caption text detected in [aria-live] region!');
+    } catch {
+      this.logger.warn(
+        'Timed out waiting for [aria-live] caption region. ' +
+          'Captions may not be enabled or no one is speaking yet. ' +
+          'Injecting observer anyway...',
+      );
+    }
+
+    // Inject MutationObserver into the page (exact Recall.ai approach)
+    // Key difference from previous implementation: processes mutated nodes
+    // directly instead of scanning the entire DOM on every mutation.
     try {
       await page.evaluate(() => {
+        // Google Meet caption speaker badge CSS classes
         const badgeSel = '.NWpY1d, .xoMHSc';
+        let lastSpeaker = 'Unknown Speaker';
 
-        function getSpeaker(node: Element): string {
-          const badge = node.querySelector(badgeSel);
-          if (badge) {
-            return badge.textContent?.trim() || 'Unknown';
-          }
-          // Fallback: first child element might be the speaker name
-          const children = node.children;
-          if (children.length >= 2) {
-            return children[0]?.textContent?.trim() || 'Unknown';
-          }
-          return 'Unknown';
-        }
+        // Extract the speaker name from a caption node
+        const getSpeaker = (node: HTMLElement): string => {
+          const badge = node.querySelector<HTMLElement>(badgeSel);
+          const speaker = badge?.textContent?.trim();
+          return speaker || lastSpeaker;
+        };
 
-        function getText(node: Element): string {
-          // Clone the node and remove the badge to get just the caption text
-          const clone = node.cloneNode(true) as Element;
-          const badges = clone.querySelectorAll(badgeSel);
-          badges.forEach((b) => b.remove());
-          return clone.textContent?.trim() || '';
-        }
+        // Extract just the caption text (removing the speaker badge)
+        const getText = (node: HTMLElement): string => {
+          const clone = node.cloneNode(true) as HTMLElement;
+          clone
+            .querySelectorAll<HTMLElement>(badgeSel)
+            .forEach((el) => el.remove());
+          return clone.textContent?.trim() ?? '';
+        };
 
-        // Track what we've already seen to avoid duplicate emissions
-        let lastSpeaker = '';
-        let lastText = '';
-
-        const observer = new MutationObserver(() => {
-          // Find caption containers in the DOM
-          // Google Meet captions appear in the lower portion of the viewport
-          const allDivs = document.querySelectorAll('div[class]');
-
-          for (const div of allDivs) {
-            const rect = div.getBoundingClientRect();
-            // Caption containers sit in the bottom half of the viewport
-            if (rect.top < window.innerHeight * 0.5) continue;
-            if (rect.height < 20 || rect.height > 300) continue;
-            if (rect.width < 100) continue;
-
-            const speaker = getSpeaker(div);
-            const text = getText(div);
-
-            if (!text || text.length < 2 || text.length > 500) continue;
-            if (text === lastText && speaker === lastSpeaker) continue;
-
-            lastSpeaker = speaker;
-            lastText = text;
-
-            // Call the exposed Node function
+        // Process a potential caption node
+        const send = (node: HTMLElement): void => {
+          const txt = getText(node);
+          const spk = getSpeaker(node);
+          // Only send if there's real text and it's not just the speaker name
+          if (txt && txt.toLowerCase() !== spk.toLowerCase()) {
             try {
-              (window as any).onCaption(speaker, text);
+              (window as any).onCaption(spk, txt);
             } catch {
-              // Function may not be available yet
+              // onCaption may not be available yet
+            }
+            lastSpeaker = spk;
+          }
+        };
+
+        // Watch DOM for caption updates — process only the mutated nodes
+        const observer = new MutationObserver((mutations) => {
+          for (const m of mutations) {
+            // New caption elements added to the DOM
+            Array.from(m.addedNodes).forEach((n) => {
+              if (n instanceof HTMLElement) send(n);
+            });
+            // Live text edits inside an existing caption element
+            if (
+              m.type === 'characterData' &&
+              m.target?.parentElement instanceof HTMLElement
+            ) {
+              send(m.target.parentElement);
             }
           }
         });
 
         observer.observe(document.body, {
           childList: true,
-          subtree: true,
           characterData: true,
+          subtree: true,
         });
 
-        // Store observer reference so it can be cleaned up
+        // Store observer reference for cleanup
         (window as any).__meetbot_observer = observer;
       });
 
