@@ -1,6 +1,5 @@
 import { getToken } from "./auth";
-
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+import { getApiUrl } from "./config";
 
 // ─── Interfaces matching backend entities/responses exactly ─────────────────
 
@@ -263,10 +262,9 @@ export function parseMeetingUrl(
 // ─── API Client ─────────────────────────────────────────────────────────────
 
 class ApiClient {
-  private baseUrl: string;
-
-  constructor(baseUrl: string) {
-    this.baseUrl = baseUrl;
+  /** Resolved lazily at request time so runtime config is picked up */
+  private get baseUrl(): string {
+    return getApiUrl();
   }
 
   /**
@@ -536,4 +534,4 @@ class ApiClient {
   }
 }
 
-export const api = new ApiClient(BASE_URL);
+export const api = new ApiClient();

@@ -3,8 +3,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import { getToken } from "@/lib/auth";
-
-const WS_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+import { getApiUrl } from "@/lib/config";
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
 const PING_INTERVAL = 25000;
 
@@ -94,7 +93,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
     cleanup();
 
-    const socket = io(WS_URL, {
+    const socket = io(getApiUrl(), {
       path: "/ws",
       auth: { token },
       transports: ["websocket"],
