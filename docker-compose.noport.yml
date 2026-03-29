@@ -33,8 +33,6 @@ services:
   auth-generator:
     image: node:20-slim
     working_dir: /app
-    profiles:
-      - auth
     volumes:
       - ./backend:/app
       - backend-data:/app/data
