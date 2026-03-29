@@ -2,6 +2,9 @@ import type { Metadata } from "next";
 import { Providers } from "./providers";
 import "./globals.css";
 
+// Force dynamic rendering so process.env is read at REQUEST time, not build time
+export const dynamic = "force-dynamic";
+
 export const metadata: Metadata = {
   title: "MeetBot - Meeting Transcription Dashboard",
   description:
@@ -13,9 +16,9 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
-  // Inject the API URL into window.__RUNTIME_CONFIG__ so client-side code
-  // can read it at runtime (instead of relying on build-time NEXT_PUBLIC_*).
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+  // Read the RUNTIME_API_URL env var (server-only, no NEXT_PUBLIC_ prefix).
+  // This is evaluated at request time because of `dynamic = "force-dynamic"`.
+  const apiUrl = process.env.RUNTIME_API_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
   const runtimeConfigScript = `window.__RUNTIME_CONFIG__=${JSON.stringify({ apiUrl })};`;
 
   return (

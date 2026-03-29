@@ -25,6 +25,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     environment:
+      - RUNTIME_API_URL=${NEXT_PUBLIC_API_URL}
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
     depends_on:
       - backend
