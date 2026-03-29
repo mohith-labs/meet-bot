@@ -1,0 +1,70 @@
+services:
+  auth-generator:
+    image: node:20-slim
+    working_dir: /app
+    ports:
+      - "6080:6080"
+    volumes:
+      - ./backend:/app
+      - auth-data:/app/data
+    environment:
+      - DISPLAY=:99
+    command: >
+      bash -c "
+        echo '>>> Installing dependencies...' &&
+        apt-get update && apt-get install -y --no-install-recommends
+          xvfb
+          x11vnc
+          novnc
+          websockify
+          libnss3
+          libatk1.0-0
+          libatk-bridge2.0-0
+          libcups2
+          libdrm2
+          libxkbcommon0
+          libxcomposite1
+          libxdamage1
+          libxrandr2
+          libgbm1
+          libpango-1.0-0
+          libcairo2
+          libasound2
+          libxshmfence1
+          libgtk-3-0
+          libx11-xcb1
+          fonts-liberation
+          wget
+          ca-certificates
+          procps &&
+        echo '>>> Installing npm packages...' &&
+        npm ci &&
+        npx playwright install chromium &&
+        echo '>>> Starting virtual display...' &&
+        Xvfb :99 -screen 0 1280x720x24 &
+        sleep 2 &&
+        echo '>>> Starting VNC server...' &&
+        x11vnc -display :99 -nopw -forever -shared &
+        sleep 1 &&
+        echo '>>> Starting noVNC web client...' &&
+        websockify --web /usr/share/novnc 6080 localhost:5900 &
+        sleep 1 &&
+        echo '' &&
+        echo '=============================================' &&
+        echo '  Open http://YOUR_VPS_IP:6080/vnc.html' &&
+        echo '  in your browser to see the desktop.' &&
+        echo '  The auth script will launch in 3 seconds.' &&
+        echo '=============================================' &&
+        echo '' &&
+        sleep 3 &&
+        node scripts/generate-auth.js &&
+        echo '' &&
+        echo '>>> auth.json generated! Copying to data volume...' &&
+        cp -f /app/auth.json /app/data/auth.json 2>/dev/null;
+        echo '>>> Done! You can close this now.' &&
+        echo '>>> Press Ctrl+C to stop.' &&
+        sleep infinity
+      "
+
+volumes:
+  auth-data:
