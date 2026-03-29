@@ -26,8 +26,11 @@ interface ActiveBot {
   emitter: EventEmitter;
   flushInterval?: NodeJS.Timeout;
   endMonitorInterval?: NodeJS.Timeout;
+  participantMonitorInterval?: NodeJS.Timeout;
   hardTimeoutTimer?: NodeJS.Timeout;
   isRunning: boolean;
+  /** Number of minutes the bot waits alone before auto-exiting (0 = disabled) */
+  autoExitMinutes: number;
   /** Current unfinalised caption state, updated by the scraping closure */
   currentSpeaker: string;
   currentText: string;
@@ -54,6 +57,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     meetingUrl: string;
     botName: string;
     meetingKey: string;
+    autoExitMinutes?: number; // 0 = disabled
   }): Promise<EventEmitter> {
     const { meetingUrl, botName, meetingKey } = options;
     const emitter = new EventEmitter();
@@ -112,6 +116,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         page,
         emitter,
         isRunning: true,
+        autoExitMinutes: options.autoExitMinutes || 0,
         currentSpeaker: '',
         currentText: '',
         segmentTimestamp: new Date(),
@@ -231,6 +236,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
     // Step 11: Monitor for meeting end
     this.monitorMeetingEnd(page, meetingKey, emitter);
+
+    // Step 12: Monitor participant count for auto-exit when alone
+    this.monitorParticipants(page, meetingKey, emitter);
   }
 
   // ---------------------------------------------------------------------------
@@ -999,6 +1007,108 @@ export class GoogleMeetBotService implements OnModuleDestroy {
   }
 
   // ---------------------------------------------------------------------------
+  // Participant monitoring — auto-exit when bot is alone
+  // ---------------------------------------------------------------------------
+
+  private monitorParticipants(
+    page: Page,
+    meetingKey: string,
+    emitter: EventEmitter,
+  ): void {
+    const bot = this.activeBots.get(meetingKey);
+    if (!bot || bot.autoExitMinutes <= 0) return;
+
+    const autoExitMs = bot.autoExitMinutes * 60 * 1000;
+    let aloneStartTime: number | null = null;
+
+    const checkInterval = setInterval(async () => {
+      if (!bot.isRunning) {
+        clearInterval(checkInterval);
+        return;
+      }
+
+      try {
+        // Get participant count from the Google Meet UI
+        const participantCount = await page.evaluate(() => {
+          // Strategy 1: Look for participant count in the button/badge
+          // Google Meet shows participant count near the people icon
+          const countEls = document.querySelectorAll(
+            '[data-participant-count], [aria-label*="participant" i]',
+          );
+          for (const el of countEls) {
+            const text = el.textContent?.trim() || '';
+            const match = text.match(/(\d+)/);
+            if (match) return parseInt(match[1], 10);
+            // Also check aria-label like "2 participants"
+            const label = el.getAttribute('aria-label') || '';
+            const labelMatch = label.match(/(\d+)/);
+            if (labelMatch) return parseInt(labelMatch[1], 10);
+          }
+
+          // Strategy 2: Look for "You're the only one here" text
+          const body = document.body.textContent?.toLowerCase() || '';
+          if (
+            body.includes("you're the only one here") ||
+            body.includes('you are the only one here') ||
+            body.includes('no one else is here')
+          ) {
+            return 1;
+          }
+
+          // Strategy 3: Count video tiles
+          const tiles = document.querySelectorAll(
+            '[data-self-name], [data-participant-id]',
+          );
+          if (tiles.length > 0) return tiles.length;
+
+          // Can't determine — return -1 to indicate unknown
+          return -1;
+        });
+
+        if (participantCount === -1) {
+          // Unknown — don't trigger auto-exit
+          return;
+        }
+
+        if (participantCount <= 1) {
+          // Bot is alone
+          if (aloneStartTime === null) {
+            aloneStartTime = Date.now();
+            this.logger.log(
+              `Bot is alone in meeting ${meetingKey}. Will auto-exit in ${bot.autoExitMinutes} minutes if no one joins.`,
+            );
+          }
+
+          const aloneTime = Date.now() - aloneStartTime;
+          if (aloneTime >= autoExitMs) {
+            this.logger.log(
+              `Auto-exit triggered for meeting ${meetingKey}: alone for ${bot.autoExitMinutes} minutes`,
+            );
+            emitter.emit('status', 'stopping');
+            emitter.emit('ended');
+            await this.stopBot(meetingKey);
+            clearInterval(checkInterval);
+            return;
+          }
+        } else {
+          // Someone else is in the meeting — reset the alone timer
+          if (aloneStartTime !== null) {
+            this.logger.log(
+              `Participant joined meeting ${meetingKey}, resetting auto-exit timer`,
+            );
+            aloneStartTime = null;
+          }
+        }
+      } catch {
+        // Page may be closed — stop monitoring
+        clearInterval(checkInterval);
+      }
+    }, 15000); // Check every 15 seconds
+
+    bot.participantMonitorInterval = checkInterval;
+  }
+
+  // ---------------------------------------------------------------------------
   // Stop / cleanup
   // ---------------------------------------------------------------------------
 
@@ -1014,6 +1124,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     // Clear intervals and timers
     if (bot.flushInterval) clearInterval(bot.flushInterval);
     if (bot.endMonitorInterval) clearInterval(bot.endMonitorInterval);
+    if (bot.participantMonitorInterval) clearInterval(bot.participantMonitorInterval);
     if (bot.hardTimeoutTimer) clearTimeout(bot.hardTimeoutTimer);
 
     // Try to leave the meeting gracefully

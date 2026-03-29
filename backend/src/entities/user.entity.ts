@@ -8,6 +8,7 @@ import {
 } from 'typeorm';
 import { ApiKey } from './api-key.entity';
 import { Meeting } from './meeting.entity';
+import { Webhook } from './webhook.entity';
 
 @Entity('users')
 export class User {
@@ -34,4 +35,13 @@ export class User {
 
   @OneToMany(() => Meeting, (meeting) => meeting.user)
   meetings: Meeting[];
+
+  @Column({ default: 5 })
+  botAutoExitMinutes: number; // Exit meeting after N minutes if alone (0 = disabled)
+
+  @Column({ default: true })
+  botAutoExitEnabled: boolean;
+
+  @OneToMany(() => Webhook, (webhook) => webhook.user)
+  webhooks: Webhook[];
 }

@@ -169,6 +169,62 @@ export interface ApiKeyCreateResponse {
   message: string;
 }
 
+// Webhook types
+export interface WebhookHeader {
+  key: string;
+  value: string;
+}
+
+export interface Webhook {
+  id: string;
+  url: string;
+  name: string;
+  secret?: string;
+  headers: WebhookHeader[];
+  events: string[];
+  isActive: boolean;
+  lastTriggeredAt: string | null;
+  lastStatus: number | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateWebhookData {
+  url: string;
+  name?: string;
+  secret?: string;
+  headers?: WebhookHeader[];
+  events?: string[];
+}
+
+export interface UpdateWebhookData {
+  url?: string;
+  name?: string;
+  secret?: string;
+  headers?: WebhookHeader[];
+  events?: string[];
+  isActive?: boolean;
+}
+
+export interface WebhookTestResult {
+  success: boolean;
+  status?: number;
+  error?: string;
+}
+
+// Settings types
+export interface UserSettings {
+  botAutoExitEnabled: boolean;
+  botAutoExitMinutes: number;
+  defaultBotName: string;
+}
+
+export interface UpdateSettingsData {
+  botAutoExitEnabled?: boolean;
+  botAutoExitMinutes?: number;
+}
+
 // ─── URL parsing helper ─────────────────────────────────────────────────────
 
 /**
@@ -386,6 +442,49 @@ class ApiClient {
   async revokeApiKey(id: string): Promise<{ message: string }> {
     return this.request<{ message: string }>(`/api-keys/${encodeURIComponent(id)}`, {
       method: "DELETE",
+    });
+  }
+
+  // ── Webhooks ──────────────────────────────────────────────────────────────
+
+  async listWebhooks(): Promise<Webhook[]> {
+    return this.request<Webhook[]>("/webhooks");
+  }
+
+  async createWebhook(data: CreateWebhookData): Promise<Webhook> {
+    return this.request<Webhook>("/webhooks", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async updateWebhook(id: string, data: UpdateWebhookData): Promise<Webhook> {
+    return this.request<Webhook>(`/webhooks/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteWebhook(id: string): Promise<void> {
+    return this.request<void>(`/webhooks/${id}`, { method: "DELETE" });
+  }
+
+  async testWebhook(id: string): Promise<WebhookTestResult> {
+    return this.request<WebhookTestResult>(`/webhooks/${id}/test`, {
+      method: "POST",
+    });
+  }
+
+  // ── Settings ──────────────────────────────────────────────────────────────
+
+  async getSettings(): Promise<UserSettings> {
+    return this.request<UserSettings>("/settings");
+  }
+
+  async updateSettings(data: UpdateSettingsData): Promise<UserSettings> {
+    return this.request<UserSettings>("/settings", {
+      method: "PATCH",
+      body: JSON.stringify(data),
     });
   }
 }

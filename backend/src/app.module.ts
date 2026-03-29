@@ -8,6 +8,8 @@ import { BotsModule } from './bots/bots.module';
 import { MeetingsModule } from './meetings/meetings.module';
 import { TranscriptsModule } from './transcripts/transcripts.module';
 import { WebSocketModule } from './websocket/websocket.module';
+import { WebhooksModule } from './webhooks/webhooks.module';
+import { SettingsModule } from './settings/settings.module';
 import { databaseConfig } from './config/database.config';
 
 @Module({
@@ -28,6 +30,8 @@ import { databaseConfig } from './config/database.config';
     MeetingsModule,
     TranscriptsModule,
     WebSocketModule,
+    WebhooksModule,
+    SettingsModule,
   ],
 })
 export class AppModule {}

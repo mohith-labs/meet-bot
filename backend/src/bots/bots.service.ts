@@ -20,6 +20,8 @@ import { TranscriptSegment } from '../entities/transcript-segment.entity';
 import { CreateBotDto, UpdateBotConfigDto } from './dto/create-bot.dto';
 import { GoogleMeetBotService, CaptionEvent } from './google-meet-bot.service';
 import { TranscriptGateway } from '../websocket/transcript.gateway';
+import { WebhookDispatcherService } from '../webhooks/webhook-dispatcher.service';
+import { UsersService } from '../users/users.service';
 
 @Injectable()
 export class BotsService {
@@ -46,6 +48,8 @@ export class BotsService {
     @Inject(forwardRef(() => TranscriptGateway))
     private readonly transcriptGateway: TranscriptGateway,
     private readonly configService: ConfigService,
+    private readonly webhookDispatcher: WebhookDispatcherService,
+    private readonly usersService: UsersService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -112,7 +116,7 @@ export class BotsService {
     );
 
     // Launch the real bot (async — doesn't block the response)
-    this.launchBot(meetingId, meetingKey, constructedMeetingUrl, botName);
+    this.launchBot(meetingId, meetingKey, constructedMeetingUrl, botName, userId);
 
     return savedMeeting;
   }
@@ -126,14 +130,22 @@ export class BotsService {
     meetingKey: string,
     meetingUrl: string,
     botName: string,
+    userId: string,
   ): Promise<void> {
     let emitter: EventEmitter;
+
+    // Fetch user settings for auto-exit
+    const user = await this.usersService.findById(userId);
+    const autoExitMinutes = user?.botAutoExitEnabled
+      ? (user?.botAutoExitMinutes || 5)
+      : 0;
 
     try {
       emitter = await this.googleMeetBotService.joinMeeting({
         meetingUrl,
         botName,
         meetingKey: meetingId, // use DB ID as the unique key inside GoogleMeetBotService
+        autoExitMinutes,
       });
     } catch (error) {
       this.logger.error(
@@ -189,6 +201,20 @@ export class BotsService {
         status: mappedStatus,
         startTime: now,
       });
+
+      // Dispatch meeting.started webhook
+      const meeting = await this.meetingsRepository.findOne({ where: { id: meetingId } });
+      if (meeting) {
+        this.webhookDispatcher.dispatch(meeting.userId, 'meeting.started', {
+          meetingId: meeting.id,
+          platform: meeting.platform,
+          nativeMeetingId: meeting.nativeMeetingId,
+          meetingUrl: meeting.constructedMeetingUrl,
+          botName: meeting.data?.botName || 'MeetBot',
+          status: 'active',
+          startTime: meeting.startTime?.toISOString(),
+        });
+      }
     } else {
       await this.meetingsRepository.update(meetingId, {
         status: mappedStatus,
@@ -261,6 +287,36 @@ export class BotsService {
       // Save all accumulated transcript segments
       await this.saveBufferedTranscripts(meetingId);
 
+      // Dispatch meeting.ended webhook with transcript data
+      const meeting = await this.meetingsRepository.findOne({ where: { id: meetingId } });
+      const segments = await this.transcriptSegmentsRepository.find({
+        where: { meetingId },
+        order: { startTime: 'ASC' },
+      });
+
+      if (meeting) {
+        this.webhookDispatcher.dispatch(meeting.userId, 'meeting.ended', {
+          meetingId: meeting.id,
+          platform: meeting.platform,
+          nativeMeetingId: meeting.nativeMeetingId,
+          meetingUrl: meeting.constructedMeetingUrl,
+          botName: meeting.data?.botName || 'MeetBot',
+          status: 'completed',
+          startTime: meeting.startTime?.toISOString(),
+          endTime: new Date().toISOString(),
+          transcript: {
+            totalSegments: segments.length,
+            fullText: segments.map(s => s.text).join(' '),
+            segments: segments.map(s => ({
+              speaker: s.speaker,
+              text: s.text,
+              startTime: s.startTime,
+              endTime: s.endTime,
+            })),
+          },
+        });
+      }
+
       await this.meetingsRepository.update(meetingId, {
         status: MeetingStatus.COMPLETED,
         endTime: new Date(),
@@ -315,6 +371,33 @@ export class BotsService {
 
     // Save all accumulated transcript segments
     await this.saveBufferedTranscripts(meeting.id);
+
+    // Dispatch meeting.ended webhook with transcript data
+    const segments = await this.transcriptSegmentsRepository.find({
+      where: { meetingId: meeting.id },
+      order: { startTime: 'ASC' },
+    });
+
+    this.webhookDispatcher.dispatch(meeting.userId, 'meeting.ended', {
+      meetingId: meeting.id,
+      platform: meeting.platform,
+      nativeMeetingId: meeting.nativeMeetingId,
+      meetingUrl: meeting.constructedMeetingUrl,
+      botName: meeting.data?.botName || 'MeetBot',
+      status: 'completed',
+      startTime: meeting.startTime?.toISOString(),
+      endTime: new Date().toISOString(),
+      transcript: {
+        totalSegments: segments.length,
+        fullText: segments.map(s => s.text).join(' '),
+        segments: segments.map(s => ({
+          speaker: s.speaker,
+          text: s.text,
+          startTime: s.startTime,
+          endTime: s.endTime,
+        })),
+      },
+    });
 
     // NOW stop the Playwright browser (safe — captions already saved)
     try {
