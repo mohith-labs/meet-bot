@@ -647,221 +647,317 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     const bot = this.activeBots.get(meetingKey);
     if (!bot) return;
 
-    // Track active segments per speaker
-    const activeSegments = new Map<
-      string,
-      { speaker: string; text: string; lastUpdated: number }
-    >();
+    // -------------------------------------------------------------------------
+    // Hybrid approach: MutationObserver scoped to the Captions region ONLY,
+    // with exposeFunction bridge to Node.js, and robust speaker extraction.
+    //
+    // Google Meet has many [aria-live] regions (status announcements, chat, etc).
+    // The CAPTIONS region is specifically: [role="region"][aria-label="Captions"]
+    // We MUST wait for this exact element and observe ONLY inside it.
+    // -------------------------------------------------------------------------
 
-    // Expose a function from browser → Node to receive caption updates
+    // Step 1: Wait for the specific Captions region
+    this.logger.log('Waiting for Captions region to appear...');
+    try {
+      // The captions region has aria-label="Captions" (exact) or contains "aption"
+      await page.waitForSelector(
+        '[role="region"][aria-label*="aption" i]',
+        { timeout: 60_000 },
+      );
+      this.logger.log('Captions region found!');
+    } catch {
+      this.logger.warn(
+        'Could not find Captions region. Captions may not be enabled.',
+      );
+      return;
+    }
+
+    // Step 2: Track state in Node
+    let currentSpeaker = '';
+    let currentText = '';
+    let lastChangeTime = Date.now();
+    const FINALIZE_AFTER_MS = 2000;
+
+    // Step 3: Expose the bridge function BEFORE injecting the observer
     try {
       await page.exposeFunction(
-        'onCaption',
+        '__meetbot_onCaption',
         (speaker: string, text: string) => {
           if (!bot.isRunning) return;
-          if (!text || text.trim().length === 0) return;
 
-          const cleanSpeaker = speaker?.trim() || 'Unknown';
-          const cleanText = text.trim();
+          const cleanSpeaker = (speaker || '').trim() || currentSpeaker || 'Unknown';
+          const cleanText = (text || '').trim();
+          if (!cleanText || cleanText.length < 2) return;
+
+          // Filter out Google Meet system/status messages
+          const systemPhrases = [
+            'you have joined',
+            'joined the call',
+            'other person',
+            'camera is turned',
+            'microphone is turned',
+            'hand is lowered',
+            'hand is raised',
+            'is presenting',
+            'left the meeting',
+            'return to home',
+            'leave call',
+            'feedback',
+            'audio and video',
+            'learn more',
+            'recording',
+            'transcript',
+          ];
+          const lower = cleanText.toLowerCase();
+          if (systemPhrases.some((p) => lower.includes(p))) return;
+
           const now = Date.now();
+          const speakerChanged =
+            currentSpeaker !== '' && cleanSpeaker !== currentSpeaker;
+          const textChanged = cleanText !== currentText;
 
-          const existingSegment = activeSegments.get(cleanSpeaker);
+          if (!textChanged && !speakerChanged) return; // Exact duplicate
 
-          if (existingSegment) {
-            // Same speaker — check if this is an update or new text
-            if (
-              cleanText.length >= existingSegment.text.length &&
-              cleanText.startsWith(existingSegment.text.substring(0, 10))
-            ) {
-              // Text is growing (caption extending) — update segment
-              existingSegment.text = cleanText;
-              existingSegment.lastUpdated = now;
+          // Speaker changed — finalize the previous speaker's segment
+          if (speakerChanged && currentText) {
+            emitter.emit('caption', {
+              speaker: currentSpeaker,
+              text: currentText,
+              timestamp: new Date(),
+              isFinal: true,
+            } as CaptionEvent);
+            this.logger.debug(
+              `[Final] [${currentSpeaker}] "${currentText}"`,
+            );
+            currentSpeaker = '';
+            currentText = '';
+          }
 
-              // Emit interim caption
-              emitter.emit('caption', {
-                speaker: cleanSpeaker,
-                text: cleanText,
-                timestamp: new Date(),
-                isFinal: false,
-              } as CaptionEvent);
-            } else {
-              // Different text from same speaker — finalize old, start new
-              emitter.emit('caption', {
-                speaker: existingSegment.speaker,
-                text: existingSegment.text,
-                timestamp: new Date(),
-                isFinal: true,
-              } as CaptionEvent);
-
-              activeSegments.set(cleanSpeaker, {
-                speaker: cleanSpeaker,
-                text: cleanText,
-                lastUpdated: now,
-              });
-
-              emitter.emit('caption', {
-                speaker: cleanSpeaker,
-                text: cleanText,
-                timestamp: new Date(),
-                isFinal: false,
-              } as CaptionEvent);
-            }
-          } else {
-            // New speaker — finalize any other active segments
-            for (const [key, segment] of activeSegments.entries()) {
-              if (key !== cleanSpeaker) {
-                emitter.emit('caption', {
-                  speaker: segment.speaker,
-                  text: segment.text,
-                  timestamp: new Date(),
-                  isFinal: true,
-                } as CaptionEvent);
-                activeSegments.delete(key);
-              }
-            }
-
-            // Start new segment
-            activeSegments.set(cleanSpeaker, {
-              speaker: cleanSpeaker,
-              text: cleanText,
-              lastUpdated: now,
-            });
-
+          if (speakerChanged || !currentText) {
+            // New speaker or first segment
+            currentSpeaker = cleanSpeaker;
+            currentText = cleanText;
+            lastChangeTime = now;
             emitter.emit('caption', {
               speaker: cleanSpeaker,
               text: cleanText,
               timestamp: new Date(),
               isFinal: false,
             } as CaptionEvent);
+          } else if (textChanged) {
+            // Same speaker, text changed
+            const isGrowing =
+              cleanText.length > currentText.length &&
+              cleanText.startsWith(
+                currentText.substring(0, Math.min(15, currentText.length)),
+              );
+
+            if (isGrowing) {
+              // Caption extending
+              currentText = cleanText;
+              lastChangeTime = now;
+              emitter.emit('caption', {
+                speaker: currentSpeaker,
+                text: cleanText,
+                timestamp: new Date(),
+                isFinal: false,
+              } as CaptionEvent);
+            } else {
+              // Completely new text — finalize old, start new
+              if (currentText) {
+                emitter.emit('caption', {
+                  speaker: currentSpeaker,
+                  text: currentText,
+                  timestamp: new Date(),
+                  isFinal: true,
+                } as CaptionEvent);
+                this.logger.debug(
+                  `[Final] [${currentSpeaker}] "${currentText}"`,
+                );
+              }
+              currentText = cleanText;
+              lastChangeTime = now;
+              emitter.emit('caption', {
+                speaker: currentSpeaker,
+                text: cleanText,
+                timestamp: new Date(),
+                isFinal: false,
+              } as CaptionEvent);
+            }
           }
         },
       );
-    } catch (err) {
-      this.logger.warn(`Failed to expose onCaption function: ${err.message}`);
+    } catch (err: any) {
+      this.logger.error(`Failed to expose __meetbot_onCaption: ${err.message}`);
+      return;
     }
 
-    // Wait for the [aria-live] caption region to appear (Recall.ai approach)
-    // This confirms that captions are actually rendering in the DOM
-    this.logger.log('Waiting for caption [aria-live] region to appear...');
-    try {
-      await page.waitForSelector('[aria-live]', { timeout: 30_000 });
-      this.logger.log('Found [aria-live] element, waiting for caption text...');
-
-      // Wait until at least one aria-live element has text content
-      await page.waitForFunction(
-        () => {
-          const liveElements = Array.from(
-            document.querySelectorAll<HTMLElement>('[aria-live]'),
-          );
-          return liveElements.some(
-            (el) => el.textContent && el.textContent.trim().length > 0,
-          );
-        },
-        { timeout: 60_000 },
-      );
-      this.logger.log('Caption text detected in [aria-live] region!');
-    } catch {
-      this.logger.warn(
-        'Timed out waiting for [aria-live] caption region. ' +
-          'Captions may not be enabled or no one is speaking yet. ' +
-          'Injecting observer anyway...',
-      );
-    }
-
-    // Inject MutationObserver into the page (exact Recall.ai approach)
-    // Key difference from previous implementation: processes mutated nodes
-    // directly instead of scanning the entire DOM on every mutation.
+    // Step 4: Inject MutationObserver scoped to the Captions region ONLY
     try {
       await page.evaluate(() => {
-        // Google Meet caption speaker badge CSS classes
-        const badgeSel = '.NWpY1d, .xoMHSc';
-        let lastSpeaker = 'Unknown Speaker';
+        // Find the EXACT captions region — NOT the generic [aria-live] status areas
+        const captionsRegion = document.querySelector<HTMLElement>(
+          '[role="region"][aria-label*="aption" i]',
+        );
+        if (!captionsRegion) {
+          console.error('[MeetBot] Captions region not found');
+          return;
+        }
 
-        // Extract the speaker name from a caption node
-        const getSpeaker = (node: HTMLElement): string => {
-          const badge = node.querySelector<HTMLElement>(badgeSel);
-          const speaker = badge?.textContent?.trim();
-          return speaker || lastSpeaker;
-        };
+        console.log(
+          '[MeetBot] Observing captions region:',
+          captionsRegion.getAttribute('aria-label'),
+        );
 
-        // Extract just the caption text (removing the speaker badge)
-        const getText = (node: HTMLElement): string => {
-          const clone = node.cloneNode(true) as HTMLElement;
-          clone
-            .querySelectorAll<HTMLElement>(badgeSel)
-            .forEach((el) => el.remove());
-          return clone.textContent?.trim() ?? '';
-        };
+        let lastSpeaker = '';
+        let lastText = '';
 
-        // Process a potential caption node
-        const send = (node: HTMLElement): void => {
-          const txt = getText(node);
-          const spk = getSpeaker(node);
-          // Only send if there's real text and it's not just the speaker name
-          if (txt && txt.toLowerCase() !== spk.toLowerCase()) {
-            try {
-              (window as any).onCaption(spk, txt);
-            } catch {
-              // onCaption may not be available yet
+        // Extract speaker + text from a caption entry node.
+        // Google Meet caption entries typically look like:
+        //   <div>
+        //     <div><img ...><span>Speaker Name</span></div>
+        //     <div><span>Caption text words...</span></div>
+        //   </div>
+        // But the exact structure changes. We use a heuristic:
+        // walk the children, find the first short text (<40 chars) that
+        // is NOT the entire text content — that's the speaker name.
+        const extractFromNode = (
+          node: HTMLElement,
+        ): { speaker: string; text: string } | null => {
+          const fullText = node.textContent?.trim() || '';
+          if (!fullText || fullText.length < 2) return null;
+
+          // Try to find speaker from child structure
+          let speaker = '';
+          let captionText = fullText;
+
+          // Strategy 1: Look for an img with alt text (avatar)
+          const img = node.querySelector('img');
+          if (img && img.alt) {
+            speaker = img.alt.trim();
+          }
+
+          // Strategy 2: Look at direct child elements
+          const directChildren = Array.from(node.children) as HTMLElement[];
+          if (directChildren.length >= 2) {
+            for (const child of directChildren) {
+              const ct = child.textContent?.trim() || '';
+              // A speaker label is short and not the full text
+              if (
+                ct.length > 0 &&
+                ct.length < 40 &&
+                ct.length < fullText.length * 0.5
+              ) {
+                speaker = ct;
+                captionText = fullText.replace(ct, '').trim();
+                break;
+              }
             }
-            lastSpeaker = spk;
+          }
+
+          // If speaker is still empty, walk deeper
+          if (!speaker) {
+            const allSpans = node.querySelectorAll<HTMLElement>('span, div');
+            for (const span of allSpans) {
+              const st = span.textContent?.trim() || '';
+              if (
+                st.length > 0 &&
+                st.length < 40 &&
+                st !== fullText &&
+                st.length < fullText.length * 0.5
+              ) {
+                speaker = st;
+                captionText = fullText.replace(st, '').trim();
+                break;
+              }
+            }
+          }
+
+          if (!captionText || captionText.length < 1) return null;
+          return { speaker: speaker || lastSpeaker, text: captionText };
+        };
+
+        const send = (node: HTMLElement): void => {
+          const result = extractFromNode(node);
+          if (!result) return;
+          // Dedup: skip exact same speaker+text
+          if (result.speaker === lastSpeaker && result.text === lastText)
+            return;
+          lastSpeaker = result.speaker || lastSpeaker;
+          lastText = result.text;
+          try {
+            (window as any).__meetbot_onCaption(result.speaker, result.text);
+          } catch {
+            /* not yet available */
           }
         };
 
-        // Watch DOM for caption updates — process only the mutated nodes
-        const observer = new MutationObserver((mutations) => {
+        // Debounce: coalesce rapid mutations within 150ms
+        let pending: HTMLElement | null = null;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const flush = () => {
+          timer = null;
+          if (pending) {
+            send(pending);
+            pending = null;
+          }
+        };
+        const enqueue = (node: HTMLElement) => {
+          pending = node;
+          if (!timer) timer = setTimeout(flush, 150);
+        };
+
+        // Observe ONLY the captions region (not document.body)
+        new MutationObserver((mutations) => {
           for (const m of mutations) {
-            // New caption elements added to the DOM
-            Array.from(m.addedNodes).forEach((n) => {
-              if (n instanceof HTMLElement) send(n);
-            });
-            // Live text edits inside an existing caption element
+            for (const n of Array.from(m.addedNodes)) {
+              if (n instanceof HTMLElement) enqueue(n);
+            }
             if (
               m.type === 'characterData' &&
               m.target?.parentElement instanceof HTMLElement
             ) {
-              send(m.target.parentElement);
+              // Walk up to find the caption entry (direct child of region)
+              let el: HTMLElement | null = m.target
+                .parentElement as HTMLElement;
+              while (el && el.parentElement !== captionsRegion) {
+                el = el.parentElement;
+              }
+              if (el) enqueue(el);
             }
           }
-        });
-
-        observer.observe(document.body, {
+        }).observe(captionsRegion, {
           childList: true,
           characterData: true,
           subtree: true,
         });
 
-        // Store observer reference for cleanup
-        (window as any).__meetbot_observer = observer;
+        console.log('[MeetBot] Caption observer attached to region');
       });
 
-      this.logger.log('Caption MutationObserver injected successfully');
-    } catch (err) {
-      this.logger.warn(
-        `Failed to inject MutationObserver: ${err.message}`,
-      );
+      this.logger.log('Caption MutationObserver injected into Captions region');
+    } catch (err: any) {
+      this.logger.warn(`Failed to inject observer: ${err.message}`);
     }
 
-    // Periodic flush: finalize segments that haven't updated in ~2 seconds
+    // Step 5: Finalize timer — if no change for 2s, emit isFinal
     bot.flushInterval = setInterval(() => {
       if (!bot.isRunning) {
         if (bot.flushInterval) clearInterval(bot.flushInterval);
         return;
       }
-
-      const now = Date.now();
-      for (const [key, segment] of activeSegments.entries()) {
-        if (now - segment.lastUpdated >= this.FLUSH_INTERVAL_MS) {
-          emitter.emit('caption', {
-            speaker: segment.speaker,
-            text: segment.text,
-            timestamp: new Date(),
-            isFinal: true,
-          } as CaptionEvent);
-          activeSegments.delete(key);
-        }
+      if (currentText && Date.now() - lastChangeTime >= FINALIZE_AFTER_MS) {
+        emitter.emit('caption', {
+          speaker: currentSpeaker,
+          text: currentText,
+          timestamp: new Date(),
+          isFinal: true,
+        } as CaptionEvent);
+        this.logger.debug(`[Final/Timeout] [${currentSpeaker}] "${currentText}"`);
+        currentSpeaker = '';
+        currentText = '';
       }
-    }, this.FLUSH_INTERVAL_MS);
+    }, FINALIZE_AFTER_MS);
   }
 
   // ---------------------------------------------------------------------------
@@ -933,7 +1029,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
     // Try to leave the meeting gracefully
     try {
-      // Try clicking "Leave call" button
       const leaveBtn = bot.page.locator(
         '[aria-label*="Leave call" i], [data-tooltip*="Leave call" i]',
       );
@@ -942,7 +1037,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         this.logger.debug('Clicked "Leave call" button');
         await bot.page.waitForTimeout(1000);
       } else {
-        // Fallback: keyboard shortcut Ctrl+Alt+Q
         await bot.page.keyboard.down('Control');
         await bot.page.keyboard.down('Alt');
         await bot.page.keyboard.press('KeyQ');
@@ -950,19 +1044,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         await bot.page.keyboard.up('Control');
         await bot.page.waitForTimeout(1000);
       }
-    } catch {
-      // Page might already be closed
-    }
-
-    // Disconnect the MutationObserver
-    try {
-      await bot.page.evaluate(() => {
-        const observer = (window as any).__meetbot_observer;
-        if (observer) {
-          observer.disconnect();
-          (window as any).__meetbot_observer = null;
-        }
-      });
     } catch {
       // Page might already be closed
     }

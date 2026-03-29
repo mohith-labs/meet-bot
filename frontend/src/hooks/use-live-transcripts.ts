@@ -40,12 +40,19 @@ export function useLiveTranscripts(meetingId: string | null) {
 
       setSegments((prev) => {
         const next = new Map(prev);
-        // Use segment id as key for reliable deduplication (Issue 3)
-        const key = data.segment.id || String(data.segment.absoluteStartTime) || String(Date.now());
+        const key =
+          data.segment.id ||
+          String(data.segment.absoluteStartTime) ||
+          String(Date.now());
         const existing = next.get(key);
 
-        // Don't overwrite final segments with mutable ones
-        if (existing?.isFinal) return prev;
+        // Don't overwrite final segments with interim ones
+        if (existing?.isFinal && !(data.segment.isFinal ?? false)) return prev;
+
+        // Skip if text is identical to what we already have (reduces re-renders)
+        if (existing && existing.text === data.segment.text && existing.speaker === data.segment.speaker) {
+          return prev;
+        }
 
         next.set(key, {
           id: data.segment.id,
@@ -54,7 +61,7 @@ export function useLiveTranscripts(meetingId: string | null) {
           startTime: data.segment.startTime,
           endTime: data.segment.endTime,
           absoluteStartTime: data.segment.absoluteStartTime,
-          isFinal: data.segment.isFinal ?? false, // Issue 4: read from data
+          isFinal: data.segment.isFinal ?? false,
         });
 
         return next;
@@ -73,10 +80,14 @@ export function useLiveTranscripts(meetingId: string | null) {
 
       setSegments((prev) => {
         const next = new Map(prev);
-        // Use segment id as key for reliable deduplication (Issue 3)
-        const key = data.segment.id || String(data.segment.absoluteStartTime) || String(Date.now());
+        const finalKey = data.segment.id || String(data.segment.absoluteStartTime) || String(Date.now());
 
-        next.set(key, {
+        // Remove the corresponding interim entry that this final replaces.
+        // Interim keys are formatted as "interim-{absoluteStartTime}".
+        const interimKey = `interim-${data.segment.absoluteStartTime}`;
+        next.delete(interimKey);
+
+        next.set(finalKey, {
           id: data.segment.id,
           speaker: data.segment.speaker,
           text: data.segment.text,
