@@ -1,0 +1,393 @@
+import { getToken } from "./auth";
+
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+
+// ─── Interfaces matching backend entities/responses exactly ─────────────────
+
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthResponse {
+  user: User;
+  accessToken: string;
+}
+
+export type MeetingPlatform = "google_meet";
+
+export type MeetingStatus =
+  | "requested"
+  | "joining"
+  | "awaiting_admission"
+  | "active"
+  | "stopping"
+  | "completed"
+  | "failed";
+
+export interface Meeting {
+  id: string;
+  userId: string;
+  platform: MeetingPlatform;
+  nativeMeetingId: string;
+  constructedMeetingUrl: string;
+  status: MeetingStatus;
+  botContainerId: string | null;
+  startTime: string | null;
+  endTime: string | null;
+  data: Record<string, any>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Shape returned by POST /bots (createBot) */
+export interface CreateBotResponse {
+  meetingId: string;
+  platform: MeetingPlatform;
+  nativeMeetingId: string;
+  constructedMeetingUrl: string;
+  status: MeetingStatus;
+  botContainerId: string | null;
+  data: Record<string, any>;
+  createdAt: string;
+}
+
+/** Shape returned by GET /bots/status */
+export interface BotStatusItem {
+  meetingId: string;
+  platform: MeetingPlatform;
+  nativeMeetingId: string;
+  constructedMeetingUrl: string;
+  status: MeetingStatus;
+  botContainerId: string | null;
+  startTime: string | null;
+  data: Record<string, any>;
+  createdAt: string;
+}
+
+/** Shape returned by DELETE /bots/:platform/:nativeMeetingId */
+export interface StopBotResponse {
+  meetingId: string;
+  platform: MeetingPlatform;
+  nativeMeetingId: string;
+  status: MeetingStatus;
+  endTime: string;
+  message: string;
+}
+
+/** Shape returned by PUT /bots/:platform/:nativeMeetingId/config */
+export interface UpdateBotConfigResponse {
+  meetingId: string;
+  platform: MeetingPlatform;
+  nativeMeetingId: string;
+  status: MeetingStatus;
+  data: Record<string, any>;
+  message: string;
+}
+
+/** Shape returned by GET /meetings/:platform/:nativeMeetingId (single meeting detail) */
+export interface MeetingDetail {
+  id: string;
+  platform: MeetingPlatform;
+  nativeMeetingId: string;
+  constructedMeetingUrl: string;
+  status: MeetingStatus;
+  botContainerId: string | null;
+  startTime: string | null;
+  endTime: string | null;
+  data: Record<string, any>;
+  transcriptSegments?: TranscriptSegment[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Shape returned by PATCH /meetings/:platform/:nativeMeetingId */
+export interface UpdateMeetingResponse {
+  id: string;
+  platform: MeetingPlatform;
+  nativeMeetingId: string;
+  status: MeetingStatus;
+  data: Record<string, any>;
+  updatedAt: string;
+  message: string;
+}
+
+export interface TranscriptSegment {
+  id: string;
+  text: string;
+  speaker: string;
+  language: string;
+  startTime: number;
+  endTime: number;
+  absoluteStartTime: string;
+  absoluteEndTime: string;
+  completed: boolean;
+  createdAt: string;
+}
+
+export interface TranscriptResponse {
+  meeting: {
+    id: string;
+    platform: MeetingPlatform;
+    nativeMeetingId: string;
+    constructedMeetingUrl: string;
+    status: MeetingStatus;
+    startTime: string | null;
+    endTime: string | null;
+    data: Record<string, any>;
+  };
+  segments: TranscriptSegment[];
+  totalSegments: number;
+  fullText: string;
+}
+
+export interface ShareResponse {
+  shareToken: string;
+  shareUrl: string;
+  message: string;
+}
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  key?: string;
+  keyPrefix?: string;
+  isActive: boolean;
+  lastUsedAt: string | null;
+  createdAt: string;
+}
+
+export interface ApiKeyCreateResponse {
+  id: string;
+  name: string;
+  key: string;
+  isActive: boolean;
+  createdAt: string;
+  message: string;
+}
+
+// ─── URL parsing helper ─────────────────────────────────────────────────────
+
+/**
+ * Parse a Google Meet URL into platform + nativeMeetingId.
+ * Returns null if the URL does not match a known meeting URL format.
+ */
+export function parseMeetingUrl(
+  url: string
+): { platform: "google_meet"; nativeMeetingId: string } | null {
+  const match = url.match(/meet\.google\.com\/([a-z]+-[a-z]+-[a-z]+)/);
+  if (match) {
+    return { platform: "google_meet", nativeMeetingId: match[1] };
+  }
+  return null;
+}
+
+// ─── API Client ─────────────────────────────────────────────────────────────
+
+class ApiClient {
+  private baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
+  }
+
+  /**
+   * Core request method.
+   *
+   * The backend wraps ALL successful responses in:
+   *   { success: boolean, data: T, timestamp: string }
+   *
+   * This method unwraps the envelope and returns only the `data` payload.
+   * If the response has no `data` field (unlikely but defensive), return
+   * the raw JSON as-is.
+   */
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {}
+  ): Promise<T> {
+    const token = getToken();
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...((options.headers as Record<string, string>) || {}),
+    };
+
+    if (token && token !== "undefined" && token !== "null") {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      ...options,
+      headers,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({
+        message: "An error occurred",
+      }));
+      throw new Error(error.message || `HTTP ${response.status}`);
+    }
+
+    if (response.status === 204) {
+      return undefined as T;
+    }
+
+    const json = await response.json();
+    return json.data ?? json;
+  }
+
+  // ── Auth ────────────────────────────────────────────────────────────────
+
+  async login(email: string, password: string): Promise<AuthResponse> {
+    return this.request<AuthResponse>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
+  }
+
+  async register(
+    name: string,
+    email: string,
+    password: string
+  ): Promise<AuthResponse> {
+    return this.request<AuthResponse>("/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email, password, name }),
+    });
+  }
+
+  async getProfile(): Promise<User> {
+    return this.request<User>("/auth/profile");
+  }
+
+  // ── Bots ────────────────────────────────────────────────────────────────
+
+  async createBot(data: {
+    platform: string;
+    nativeMeetingId: string;
+    botName?: string;
+    language?: string;
+    recordingEnabled?: boolean;
+    transcribeEnabled?: boolean;
+  }): Promise<CreateBotResponse> {
+    return this.request<CreateBotResponse>("/bots", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getBotStatus(): Promise<BotStatusItem[]> {
+    return this.request<BotStatusItem[]>("/bots/status");
+  }
+
+  async stopBot(
+    platform: string,
+    nativeMeetingId: string
+  ): Promise<StopBotResponse> {
+    return this.request<StopBotResponse>(
+      `/bots/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  async updateBotConfig(
+    platform: string,
+    nativeMeetingId: string,
+    config: {
+      language?: string;
+      recordingEnabled?: boolean;
+      transcribeEnabled?: boolean;
+    }
+  ): Promise<UpdateBotConfigResponse> {
+    return this.request<UpdateBotConfigResponse>(
+      `/bots/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}/config`,
+      {
+        method: "PUT",
+        body: JSON.stringify(config),
+      }
+    );
+  }
+
+  // ── Meetings ────────────────────────────────────────────────────────────
+
+  async listMeetings(): Promise<Meeting[]> {
+    return this.request<Meeting[]>("/meetings");
+  }
+
+  async getMeeting(
+    platform: string,
+    nativeMeetingId: string
+  ): Promise<MeetingDetail> {
+    return this.request<MeetingDetail>(
+      `/meetings/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`
+    );
+  }
+
+  async updateMeeting(
+    platform: string,
+    nativeMeetingId: string,
+    data: { data: Record<string, any> }
+  ): Promise<UpdateMeetingResponse> {
+    return this.request<UpdateMeetingResponse>(
+      `/meetings/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(data),
+      }
+    );
+  }
+
+  async deleteMeeting(
+    platform: string,
+    nativeMeetingId: string
+  ): Promise<{ message: string }> {
+    return this.request<{ message: string }>(
+      `/meetings/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  // ── Transcripts ─────────────────────────────────────────────────────────
+
+  async getTranscript(
+    platform: string,
+    nativeMeetingId: string
+  ): Promise<TranscriptResponse> {
+    return this.request<TranscriptResponse>(
+      `/transcripts/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`
+    );
+  }
+
+  async shareTranscript(
+    platform: string,
+    nativeMeetingId: string
+  ): Promise<ShareResponse> {
+    return this.request<ShareResponse>(
+      `/transcripts/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}/share`,
+      { method: "POST" }
+    );
+  }
+
+  // ── API Keys ────────────────────────────────────────────────────────────
+
+  async listApiKeys(): Promise<ApiKey[]> {
+    return this.request<ApiKey[]>("/api-keys");
+  }
+
+  async createApiKey(name: string): Promise<ApiKeyCreateResponse> {
+    return this.request<ApiKeyCreateResponse>("/api-keys", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  async revokeApiKey(id: string): Promise<{ message: string }> {
+    return this.request<{ message: string }>(`/api-keys/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  }
+}
+
+export const api = new ApiClient(BASE_URL);
