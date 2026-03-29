@@ -30,7 +30,7 @@ const navItems = [
     icon: Video,
   },
   {
-    label: "Live Transcription",
+    label: "Join a Meeting",
     href: "/live",
     icon: Radio,
   },

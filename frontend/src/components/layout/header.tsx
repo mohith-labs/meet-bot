@@ -9,7 +9,7 @@ import { useRouter, usePathname } from "next/navigation";
 const pageTitles: Record<string, string> = {
   "/dashboard": "Dashboard",
   "/meetings": "Meetings",
-  "/live": "Live Transcription",
+  "/live": "Join a Meeting",
   "/api-keys": "API Keys",
   "/settings": "Settings",
 };
