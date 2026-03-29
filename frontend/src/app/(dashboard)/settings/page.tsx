@@ -12,12 +12,18 @@ import {
   Clock,
   Bot,
   Shield,
+  ShieldAlert,
   Check,
   X,
   User,
+  Users,
   Mail,
   AlertTriangle,
   Save,
+  UserCog,
+  ToggleLeft,
+  ToggleRight,
+  Crown,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -32,6 +38,8 @@ import {
   type CreateWebhookData,
   type UpdateWebhookData,
   type UserSettings,
+  type AdminUser,
+  type AdminAppSettings,
 } from "@/lib/api";
 import toast from "react-hot-toast";
 
@@ -59,10 +67,22 @@ const defaultWebhookForm: WebhookFormState = {
 
 export default function SettingsPage() {
   const { user } = useAuthStore();
+  const isAdmin = user?.role === "admin";
 
   // ── Profile state ───────────────────────────────────────────────────────
   const [name] = useState(user?.name ?? "");
   const [email] = useState(user?.email ?? "");
+
+  // ── Admin state ─────────────────────────────────────────────────────────
+  const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
+  const [isLoadingAdminUsers, setIsLoadingAdminUsers] = useState(false);
+  const [togglingUserId, setTogglingUserId] = useState<string | null>(null);
+  const [promotingUserId, setPromotingUserId] = useState<string | null>(null);
+  const [showPromoteModal, setShowPromoteModal] = useState(false);
+  const [userToPromote, setUserToPromote] = useState<AdminUser | null>(null);
+  const [registrationEnabled, setRegistrationEnabled] = useState(true);
+  const [isLoadingAdminSettings, setIsLoadingAdminSettings] = useState(false);
+  const [isTogglingRegistration, setIsTogglingRegistration] = useState(false);
 
   // ── Bot settings state ──────────────────────────────────────────────────
   const [settings, setSettings] = useState<UserSettings | null>(null);
@@ -116,10 +136,42 @@ export default function SettingsPage() {
     }
   }, []);
 
+  // ── Load admin users ─────────────────────────────────────────────────
+  const loadAdminUsers = useCallback(async () => {
+    if (!isAdmin) return;
+    setIsLoadingAdminUsers(true);
+    try {
+      const data = await api.adminListUsers();
+      setAdminUsers(data);
+    } catch {
+      setAdminUsers([]);
+    } finally {
+      setIsLoadingAdminUsers(false);
+    }
+  }, [isAdmin]);
+
+  // ── Load admin app settings ────────────────────────────────────────────
+  const loadAdminSettings = useCallback(async () => {
+    if (!isAdmin) return;
+    setIsLoadingAdminSettings(true);
+    try {
+      const data = await api.adminGetSettings();
+      setRegistrationEnabled(data.registration_enabled === "true");
+    } catch {
+      setRegistrationEnabled(true);
+    } finally {
+      setIsLoadingAdminSettings(false);
+    }
+  }, [isAdmin]);
+
   useEffect(() => {
     loadSettings();
     loadWebhooks();
-  }, [loadSettings, loadWebhooks]);
+    if (isAdmin) {
+      loadAdminUsers();
+      loadAdminSettings();
+    }
+  }, [loadSettings, loadWebhooks, isAdmin, loadAdminUsers, loadAdminSettings]);
 
   // ── Save bot settings ───────────────────────────────────────────────────
   const handleSaveSettings = async (e: FormEvent) => {
@@ -136,6 +188,70 @@ export default function SettingsPage() {
       toast.error(err.message || "Failed to save settings");
     } finally {
       setIsSavingSettings(false);
+    }
+  };
+
+  // ── Admin: toggle user active status ─────────────────────────────────
+  const handleToggleUserActive = async (targetUser: AdminUser) => {
+    setTogglingUserId(targetUser.id);
+    try {
+      const updated = await api.adminUpdateUser(targetUser.id, {
+        isActive: !targetUser.isActive,
+      });
+      setAdminUsers((prev) =>
+        prev.map((u) => (u.id === updated.id ? updated : u))
+      );
+      toast.success(
+        updated.isActive
+          ? `${updated.name} has been enabled`
+          : `${updated.name} has been disabled`
+      );
+    } catch (err: any) {
+      toast.error(err.message || "Failed to update user");
+    } finally {
+      setTogglingUserId(null);
+    }
+  };
+
+  // ── Admin: promote user to admin ───────────────────────────────────────
+  const handlePromoteUser = async () => {
+    if (!userToPromote) return;
+    setPromotingUserId(userToPromote.id);
+    try {
+      const updated = await api.adminUpdateUser(userToPromote.id, {
+        role: "admin",
+      });
+      setAdminUsers((prev) =>
+        prev.map((u) => (u.id === updated.id ? updated : u))
+      );
+      toast.success(`${updated.name} has been promoted to admin`);
+    } catch (err: any) {
+      toast.error(err.message || "Failed to promote user");
+    } finally {
+      setPromotingUserId(null);
+      setShowPromoteModal(false);
+      setUserToPromote(null);
+    }
+  };
+
+  // ── Admin: toggle registration ─────────────────────────────────────────
+  const handleToggleRegistration = async () => {
+    setIsTogglingRegistration(true);
+    const newValue = !registrationEnabled;
+    try {
+      await api.adminUpdateSettings({
+        registration_enabled: newValue ? "true" : "false",
+      });
+      setRegistrationEnabled(newValue);
+      toast.success(
+        newValue
+          ? "Registration has been enabled"
+          : "Registration has been disabled"
+      );
+    } catch (err: any) {
+      toast.error(err.message || "Failed to update registration settings");
+    } finally {
+      setIsTogglingRegistration(false);
     }
   };
 
@@ -312,8 +428,270 @@ export default function SettingsPage() {
     return url.slice(0, maxLen) + "...";
   };
 
+  const activeUserCount = adminUsers.filter((u) => u.isActive).length;
+
   return (
     <div className="max-w-2xl space-y-6">
+      {/* ── Admin Panel Section ─────────────────────────────────────────── */}
+      {isAdmin && (
+        <Card className="border-amber-500/30">
+          <CardHeader>
+            <div>
+              <CardTitle>
+                <span className="inline-flex items-center gap-2 text-amber-400">
+                  <ShieldAlert className="h-5 w-5" />
+                  Admin Panel
+                </span>
+              </CardTitle>
+              <CardDescription>
+                Manage users and application settings
+              </CardDescription>
+            </div>
+          </CardHeader>
+
+          {/* ── User Management ──────────────────────────────────────────── */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-semibold text-[#e4e4f0] flex items-center gap-2">
+                  <Users className="h-4 w-4 text-amber-400" />
+                  User Management
+                </h3>
+                <p className="text-xs text-text-secondary mt-0.5">
+                  Manage user accounts
+                </p>
+              </div>
+              {!isLoadingAdminUsers && (
+                <div className="text-xs text-text-muted">
+                  {activeUserCount} active / {adminUsers.length} total
+                </div>
+              )}
+            </div>
+
+            {isLoadingAdminUsers ? (
+              <div className="flex items-center justify-center py-8">
+                <div className="h-6 w-6 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+              </div>
+            ) : adminUsers.length === 0 ? (
+              <div className="text-center py-6 border border-dashed border-[#2a2a3e] rounded-lg">
+                <Users className="h-8 w-8 text-text-muted mx-auto mb-2" />
+                <p className="text-sm text-text-secondary">No users found</p>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-[#2a2a3e] overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-[#2a2a3e] bg-[#16162a]">
+                      <th className="text-left px-4 py-2.5 text-xs font-medium text-text-muted uppercase tracking-wider">
+                        Name
+                      </th>
+                      <th className="text-left px-4 py-2.5 text-xs font-medium text-text-muted uppercase tracking-wider">
+                        Email
+                      </th>
+                      <th className="text-left px-4 py-2.5 text-xs font-medium text-text-muted uppercase tracking-wider">
+                        Role
+                      </th>
+                      <th className="text-left px-4 py-2.5 text-xs font-medium text-text-muted uppercase tracking-wider">
+                        Status
+                      </th>
+                      <th className="text-right px-4 py-2.5 text-xs font-medium text-text-muted uppercase tracking-wider">
+                        Actions
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#2a2a3e]">
+                    {adminUsers.map((adminUser) => {
+                      const isCurrentUser = adminUser.id === user?.id;
+                      const isAdminUser = adminUser.role === "admin";
+                      return (
+                        <tr
+                          key={adminUser.id}
+                          className="bg-[#0f0f23] hover:bg-[#16162a] transition-colors"
+                        >
+                          <td className="px-4 py-3 text-[#e4e4f0] font-medium truncate max-w-[140px]">
+                            {adminUser.name}
+                            {isCurrentUser && (
+                              <span className="text-xs text-text-muted ml-1">
+                                (you)
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-text-secondary truncate max-w-[180px]">
+                            {adminUser.email}
+                          </td>
+                          <td className="px-4 py-3">
+                            {isAdminUser ? (
+                              <Badge variant="brand">
+                                <Crown className="h-3 w-3 mr-1" />
+                                Admin
+                              </Badge>
+                            ) : (
+                              <Badge variant="neutral">User</Badge>
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            <Badge
+                              variant={
+                                adminUser.isActive ? "success" : "neutral"
+                              }
+                              dot
+                            >
+                              {adminUser.isActive ? "Active" : "Disabled"}
+                            </Badge>
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            {isAdminUser ? (
+                              <span className="text-xs text-text-muted italic">
+                                --
+                              </span>
+                            ) : (
+                              <div className="flex items-center justify-end gap-2">
+                                {/* Toggle active/disabled */}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleToggleUserActive(adminUser)
+                                  }
+                                  disabled={togglingUserId === adminUser.id}
+                                  title={
+                                    adminUser.isActive
+                                      ? "Disable user"
+                                      : "Enable user"
+                                  }
+                                  className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2 focus:ring-offset-[#0f0f23] disabled:opacity-50 disabled:cursor-not-allowed ${
+                                    adminUser.isActive
+                                      ? "bg-emerald-600"
+                                      : "bg-[#2a2a3e]"
+                                  }`}
+                                >
+                                  <span
+                                    className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                                      adminUser.isActive
+                                        ? "translate-x-4"
+                                        : "translate-x-0"
+                                    }`}
+                                  />
+                                </button>
+                                {/* Promote to admin */}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setUserToPromote(adminUser);
+                                    setShowPromoteModal(true);
+                                  }}
+                                  title="Promote to admin"
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs text-amber-400 hover:bg-amber-500/10 border border-amber-500/30 transition-colors"
+                                >
+                                  <Crown className="h-3 w-3" />
+                                  Promote
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* ── App Settings: Registration ──────────────────────────────── */}
+            <div className="mt-6 pt-4 border-t border-[#2a2a3e]">
+              <h3 className="text-sm font-semibold text-[#e4e4f0] flex items-center gap-2 mb-3">
+                <Settings className="h-4 w-4 text-amber-400" />
+                Registration Settings
+              </h3>
+
+              {isLoadingAdminSettings ? (
+                <div className="flex items-center justify-center py-4">
+                  <div className="h-5 w-5 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+                </div>
+              ) : (
+                <div className="flex items-center justify-between p-4 rounded-lg border border-amber-500/20 bg-amber-500/5">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <UserCog className="h-4 w-4 text-amber-400" />
+                      <p className="text-sm font-medium text-[#e4e4f0]">
+                        Allow new user registration
+                      </p>
+                    </div>
+                    <p className="text-xs text-text-secondary mt-1 ml-6">
+                      When disabled, new users cannot create accounts. Only
+                      admins can re-enable registration.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={registrationEnabled}
+                    onClick={handleToggleRegistration}
+                    disabled={isTogglingRegistration}
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2 focus:ring-offset-[#16162a] disabled:opacity-50 disabled:cursor-not-allowed ${
+                      registrationEnabled ? "bg-amber-500" : "bg-[#2a2a3e]"
+                    }`}
+                  >
+                    <span
+                      className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                        registrationEnabled
+                          ? "translate-x-5"
+                          : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* ── Promote User Confirmation Modal ─────────────────────────────── */}
+      <Modal
+        isOpen={showPromoteModal}
+        onClose={() => {
+          setShowPromoteModal(false);
+          setUserToPromote(null);
+        }}
+        title="Promote User to Admin"
+        description={`Are you sure you want to promote "${userToPromote?.name}" to admin? This action cannot be easily undone.`}
+        size="sm"
+      >
+        <div className="space-y-4">
+          <div className="flex items-start gap-3 p-3 rounded-lg bg-amber-500/5 border border-amber-500/20">
+            <AlertTriangle className="h-5 w-5 text-amber-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-amber-400">
+                This grants full admin privileges
+              </p>
+              <p className="text-xs text-text-secondary mt-0.5">
+                The user will be able to manage all users and app settings.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-3 justify-end">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setShowPromoteModal(false);
+                setUserToPromote(null);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handlePromoteUser}
+              isLoading={promotingUserId === userToPromote?.id}
+              className="bg-amber-500 hover:bg-amber-600 text-black"
+            >
+              <Crown className="h-4 w-4 mr-1" />
+              Promote to Admin
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
       {/* ── Profile Section ─────────────────────────────────────────────── */}
       <Card>
         <CardHeader>

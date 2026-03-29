@@ -24,6 +24,12 @@ export class User {
   @Column({ nullable: true })
   name: string;
 
+  @Column({ default: 'user' })
+  role: 'admin' | 'user';
+
+  @Column({ default: true })
+  isActive: boolean;
+
   @CreateDateColumn()
   createdAt: Date;
 

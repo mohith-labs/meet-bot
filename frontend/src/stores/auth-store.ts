@@ -12,6 +12,7 @@ interface AuthState {
   user: User | null;
   token: string | null;
   isAuthenticated: boolean;
+  isAdmin: boolean;
   isLoading: boolean;
   login: (email: string, password: string) => Promise<void>;
   register: (name: string, email: string, password: string) => Promise<void>;
@@ -25,16 +26,19 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   user: null,
   token: null,
   isAuthenticated: false,
+  isAdmin: false,
   isLoading: true,
 
   initialize: () => {
     const token = getToken();
     const user = getStoredUser();
     if (token && user) {
+      const storedUser = user as User;
       set({
         token,
-        user: user as User,
+        user: storedUser,
         isAuthenticated: true,
+        isAdmin: storedUser?.role === 'admin',
         isLoading: false,
       });
     } else {
@@ -50,6 +54,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       user: response.user,
       token: response.accessToken,
       isAuthenticated: true,
+      isAdmin: response.user.role === 'admin',
     });
   },
 
@@ -61,6 +66,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       user: response.user,
       token: response.accessToken,
       isAuthenticated: true,
+      isAdmin: response.user.role === 'admin',
     });
   },
 
@@ -70,6 +76,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       user: null,
       token: null,
       isAuthenticated: false,
+      isAdmin: false,
     });
   },
 
@@ -80,9 +87,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   fetchProfile: async () => {
     try {
-      const user = await api.getProfile();
-      setStoredUser(user);
-      set({ user });
+      const profile = await api.getProfile();
+      setStoredUser(profile);
+      set({ user: profile, isAdmin: profile.role === 'admin' });
     } catch {
       get().logout();
     }

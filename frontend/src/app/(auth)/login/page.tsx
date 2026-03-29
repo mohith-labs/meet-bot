@@ -1,12 +1,13 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState, useEffect, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Mail, Lock } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useAuthStore } from "@/stores/auth-store";
+import { api } from "@/lib/api";
 import toast from "react-hot-toast";
 
 export default function LoginPage() {
@@ -17,6 +18,20 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
+  const [registrationEnabled, setRegistrationEnabled] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    const checkRegistration = async () => {
+      try {
+        const result = await api.getRegistrationStatus();
+        setRegistrationEnabled(result.registrationEnabled);
+      } catch {
+        // If we can't check, default to showing the link
+        setRegistrationEnabled(true);
+      }
+    };
+    checkRegistration();
+  }, []);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -88,17 +103,19 @@ export default function LoginPage() {
         </Button>
       </form>
 
-      <div className="mt-6 text-center">
-        <p className="text-sm text-text-secondary">
-          Don&apos;t have an account?{" "}
-          <Link
-            href="/register"
-            className="text-brand-primary hover:text-brand-secondary font-medium transition-colors"
-          >
-            Create one
-          </Link>
-        </p>
-      </div>
+      {registrationEnabled !== false && (
+        <div className="mt-6 text-center">
+          <p className="text-sm text-text-secondary">
+            Don&apos;t have an account?{" "}
+            <Link
+              href="/register"
+              className="text-brand-primary hover:text-brand-secondary font-medium transition-colors"
+            >
+              Create one
+            </Link>
+          </p>
+        </div>
+      )}
     </div>
   );
 }

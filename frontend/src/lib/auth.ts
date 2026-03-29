@@ -5,6 +5,8 @@ export interface StoredUser {
   id: string;
   name: string;
   email: string;
+  role?: 'admin' | 'user';
+  isActive?: boolean;
 }
 
 export function getToken(): string | null {

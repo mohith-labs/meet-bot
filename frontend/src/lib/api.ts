@@ -8,6 +8,8 @@ export interface User {
   id: string;
   email: string;
   name: string;
+  role: 'admin' | 'user';
+  isActive: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -223,6 +225,23 @@ export interface UserSettings {
 export interface UpdateSettingsData {
   botAutoExitEnabled?: boolean;
   botAutoExitMinutes?: number;
+}
+
+// ─── Admin types ────────────────────────────────────────────────────────────
+
+export interface AdminUser {
+  id: string;
+  email: string;
+  name: string;
+  role: 'admin' | 'user';
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AdminAppSettings {
+  registration_enabled: string;
+  [key: string]: string;
 }
 
 // ─── URL parsing helper ─────────────────────────────────────────────────────
@@ -486,6 +505,34 @@ class ApiClient {
       method: "PATCH",
       body: JSON.stringify(data),
     });
+  }
+
+  // ── Admin ──────────────────────────────────────────────────────────────────
+
+  async adminListUsers(): Promise<AdminUser[]> {
+    return this.request<AdminUser[]>("/admin/users");
+  }
+
+  async adminUpdateUser(id: string, data: { isActive?: boolean; role?: string }): Promise<AdminUser> {
+    return this.request<AdminUser>(`/admin/users/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async adminGetSettings(): Promise<AdminAppSettings> {
+    return this.request<AdminAppSettings>("/admin/settings");
+  }
+
+  async adminUpdateSettings(data: Record<string, string>): Promise<AdminAppSettings> {
+    return this.request<AdminAppSettings>("/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getRegistrationStatus(): Promise<{ registrationEnabled: boolean }> {
+    return this.request<{ registrationEnabled: boolean }>("/auth/registration-status");
   }
 }
 

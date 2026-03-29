@@ -10,6 +10,7 @@ import { TranscriptsModule } from './transcripts/transcripts.module';
 import { WebSocketModule } from './websocket/websocket.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { SettingsModule } from './settings/settings.module';
+import { AdminModule } from './admin/admin.module';
 import { databaseConfig } from './config/database.config';
 
 @Module({
@@ -32,6 +33,7 @@ import { databaseConfig } from './config/database.config';
     WebSocketModule,
     WebhooksModule,
     SettingsModule,
+    AdminModule,
   ],
 })
 export class AppModule {}

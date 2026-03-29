@@ -14,6 +14,7 @@
   <img src="https://img.shields.io/badge/NestJS-E0234E?style=for-the-badge&logo=nestjs&logoColor=white" alt="NestJS" />
   <img src="https://img.shields.io/badge/Next.js-000000?style=for-the-badge&logo=nextdotjs&logoColor=white" alt="Next.js" />
   <img src="https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/Playwright-2EAD33?style=for-the-badge&logo=playwright&logoColor=white" alt="Playwright" />
   <img src="https://img.shields.io/badge/Tailwind_CSS-06B6D4?style=for-the-badge&logo=tailwindcss&logoColor=white" alt="Tailwind CSS" />
   <img src="https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite" />
   <img src="https://img.shields.io/badge/Socket.IO-010101?style=for-the-badge&logo=socketdotio&logoColor=white" alt="Socket.IO" />
@@ -24,13 +25,17 @@
 
 ## Overview
 
-MeetBot is a meeting transcription platform that allows you to send bots to Google Meet meetings, capture real-time transcriptions, and manage everything through a beautiful dark-themed dashboard or REST API. Inspired by [vexa.ai](https://vexa.ai).
+MeetBot is a meeting transcription platform that sends real bots to Google Meet meetings, captures live transcriptions via caption scraping, and lets you manage everything through a dark-themed dashboard or REST API. Inspired by [vexa.ai](https://vexa.ai).
 
-- **Send bots to Google Meet via API** -- programmatically deploy bots that join meetings and capture audio
-- **Real-time transcription via WebSocket** -- stream transcript segments as they are generated
+- **Real Google Meet bots via Playwright** -- bots join meetings with a real Google account, enable captions, and scrape transcript data in real time
+- **Real-time transcription via WebSocket** -- stream transcript segments as they are captured from Google Meet's built-in captions
 - **Dual authentication** -- protect endpoints with JWT Bearer tokens or API Keys
+- **Webhook notifications** -- receive HTTP callbacks for meeting events (`meeting.started`, `meeting.ended`) with HMAC-SHA256 signing
+- **Admin panel** -- manage users, toggle registration, and configure app-wide settings
+- **Bot auto-exit** -- configurable automatic exit when the bot is alone in a meeting
 - **Dark-themed dashboard** -- glass-morphism UI with animations built on Next.js
 - **API key management** -- create, list, and revoke API keys from the dashboard
+- **User settings** -- per-user configuration for bot behavior and preferences
 - **Swagger API documentation** -- interactive API explorer at `/api/docs`
 
 ---
@@ -74,8 +79,7 @@ Add screenshots here once available:
 | **TypeORM + SQLite** | ORM and database |
 | **Passport** | Authentication (JWT + API Key strategies) |
 | **Socket.IO** | WebSocket real-time communication |
-| **Puppeteer** | Google Meet bot (simulated) |
-| **Google Cloud Speech API** | Speech-to-text (placeholder) |
+| **Playwright** | Google Meet bot (real -- caption scraping via Playwright) |
 | **Swagger / OpenAPI** | API documentation |
 
 ### Frontend
@@ -100,6 +104,7 @@ Add screenshots here once available:
 
 - **Node.js** 20 or higher
 - **npm** or **yarn**
+- A **Google account** for the bot to sign into Google Meet
 
 ### Installation
 
@@ -109,26 +114,52 @@ cd meeting_bot
 npm run install:all
 ```
 
+### Playwright Setup
+
+Install the Chromium browser for Playwright and generate the Google authentication session:
+
+```bash
+cd backend
+npx playwright install chromium
+npm run gen:auth  # One-time: opens a browser to log into Google and saves the session to auth.json
+```
+
+The `gen:auth` script launches a headed browser where you log into the Google account the bot will use. The session is saved to `auth.json` so the bot can join meetings without re-authenticating.
+
 ### Environment Setup
 
 Create a `.env` file in the `backend/` directory:
 
 ```env
-# Server port
+# Server
 PORT=3001
 
-# Secret key for signing JWT tokens (change this in production!)
+# Authentication
 JWT_SECRET=your-super-secret-key-change-in-production
 
-# Path to the SQLite database file
+# Database
 DATABASE_URL=./database.sqlite
 
-# Google Cloud credentials (optional — for real speech-to-text)
-GOOGLE_CLOUD_PROJECT_ID=
-GOOGLE_CLOUD_KEY_FILE=
-
-# Frontend URL for CORS configuration
+# CORS
 FRONTEND_URL=http://localhost:3000
+
+# Admin account (seeded on first startup)
+ADMIN_EMAIL=admin@meetbot.com
+ADMIN_PASSWORD=admin123456
+ADMIN_NAME=Admin
+
+# Registration
+REGISTRATION_ENABLED=true
+
+# Google account for the bot
+GOOGLE_ACCOUNT_EMAIL=
+GOOGLE_ACCOUNT_PASSWORD=
+
+# Playwright auth state
+AUTH_STATE_PATH=./auth.json
+
+# Bot display name in meetings
+BOT_NAME=MeetBot
 ```
 
 | Variable | Required | Description |
@@ -136,9 +167,15 @@ FRONTEND_URL=http://localhost:3000
 | `PORT` | Yes | Port the backend server listens on |
 | `JWT_SECRET` | Yes | Secret used to sign and verify JWT tokens. **Must** be changed in production. |
 | `DATABASE_URL` | Yes | File path for the SQLite database |
-| `GOOGLE_CLOUD_PROJECT_ID` | No | GCP project ID for Speech-to-Text integration |
-| `GOOGLE_CLOUD_KEY_FILE` | No | Path to GCP service account key file |
 | `FRONTEND_URL` | Yes | Allowed origin for CORS |
+| `ADMIN_EMAIL` | Yes | Email for the seeded admin account |
+| `ADMIN_PASSWORD` | Yes | Password for the seeded admin account |
+| `ADMIN_NAME` | Yes | Display name for the seeded admin account |
+| `REGISTRATION_ENABLED` | No | Whether new user registration is allowed (default: `true`) |
+| `GOOGLE_ACCOUNT_EMAIL` | Yes | Google account email the bot uses to join meetings |
+| `GOOGLE_ACCOUNT_PASSWORD` | Yes | Google account password (used during `gen:auth`) |
+| `AUTH_STATE_PATH` | No | Path to the saved Playwright auth state (default: `./auth.json`) |
+| `BOT_NAME` | No | Display name shown when the bot joins a meeting (default: `MeetBot`) |
 
 ### Running in Development
 
@@ -174,12 +211,15 @@ meeting_bot/
 │   │   │   ├── strategies/   # Passport strategies
 │   │   │   ├── guards/       # Auth guards
 │   │   │   └── dto/          # Login/Register DTOs
+│   │   ├── admin/            # Admin seed service, admin controller
 │   │   ├── api-keys/         # API key CRUD & validation
-│   │   ├── bots/             # Bot lifecycle management
+│   │   ├── bots/             # Bot lifecycle management (Playwright-based)
 │   │   ├── meetings/         # Meeting CRUD operations
 │   │   ├── transcripts/      # Transcript retrieval & sharing
+│   │   ├── webhooks/         # Webhook CRUD & dispatcher service
+│   │   ├── settings/         # User settings controller
 │   │   ├── websocket/        # Real-time transcript streaming
-│   │   ├── entities/         # TypeORM entities
+│   │   ├── entities/         # TypeORM entities (User, Meeting, TranscriptSegment, ApiKey, Webhook, AppSettings)
 │   │   └── common/           # Guards, decorators, interceptors
 │   ├── test/
 │   └── package.json
@@ -187,7 +227,7 @@ meeting_bot/
 │   ├── src/
 │   │   ├── app/
 │   │   │   ├── (auth)/       # Login, Register pages
-│   │   │   ├── (dashboard)/  # Dashboard, Meetings, Live, API Keys, Settings
+│   │   │   ├── (dashboard)/  # Dashboard, Meetings, Live, API Keys, Settings, Admin
 │   │   │   └── (public)/     # Docs, Get Started, Pricing, Blog
 │   │   ├── components/       # UI components, layout, landing sections
 │   │   ├── hooks/            # WebSocket, live transcript hooks
@@ -228,6 +268,7 @@ Either method can be used interchangeably on endpoints that accept both.
 | `POST` | `/auth/register` | Register a new user | None |
 | `POST` | `/auth/login` | Login and receive a JWT token | None |
 | `GET` | `/auth/profile` | Get current user profile | JWT |
+| `GET` | `/auth/registration-status` | Check if registration is enabled | None |
 
 #### Bots
 
@@ -261,6 +302,32 @@ Either method can be used interchangeably on endpoints that accept both.
 | `POST` | `/api-keys` | Create a new API key | JWT only |
 | `GET` | `/api-keys` | List all API keys | JWT only |
 | `DELETE` | `/api-keys/:id` | Revoke an API key | JWT only |
+
+#### Webhooks
+
+| Method | Endpoint | Description | Auth |
+|---|---|---|---|
+| `POST` | `/webhooks` | Create a webhook | JWT |
+| `GET` | `/webhooks` | List webhooks | JWT |
+| `PATCH` | `/webhooks/:id` | Update a webhook | JWT |
+| `DELETE` | `/webhooks/:id` | Delete a webhook | JWT |
+| `POST` | `/webhooks/:id/test` | Test a webhook | JWT |
+
+#### Settings
+
+| Method | Endpoint | Description | Auth |
+|---|---|---|---|
+| `GET` | `/settings` | Get user settings | JWT |
+| `PATCH` | `/settings` | Update user settings | JWT |
+
+#### Admin
+
+| Method | Endpoint | Description | Auth |
+|---|---|---|---|
+| `GET` | `/admin/users` | List all users | Admin |
+| `PATCH` | `/admin/users/:id` | Update user (enable/disable, role) | Admin |
+| `GET` | `/admin/settings` | Get app settings | Admin |
+| `PATCH` | `/admin/settings` | Update app settings | Admin |
 
 ---
 
@@ -392,6 +459,97 @@ socket.on("pong", () => {
 
 ---
 
+## Webhooks
+
+MeetBot can send HTTP POST requests to your endpoints when meeting events occur. Webhooks are managed per-user via the API or dashboard.
+
+### Supported Events
+
+| Event | Trigger |
+|---|---|
+| `meeting.started` | A bot successfully joins a meeting and begins transcribing |
+| `meeting.ended` | A meeting ends or the bot is stopped |
+| `webhook.test` | Sent when you test a webhook from the dashboard or API |
+
+### Payload Format
+
+All webhook payloads are JSON and include an HMAC-SHA256 signature for verification.
+
+**Headers:**
+
+| Header | Description |
+|---|---|
+| `Content-Type` | `application/json` |
+| `X-Webhook-Signature` | HMAC-SHA256 hex digest of the request body, signed with the webhook's secret |
+| Custom headers | Any additional headers configured on the webhook |
+
+**Example payload (`meeting.started`):**
+
+```json
+{
+  "event": "meeting.started",
+  "timestamp": "2026-03-29T10:00:00.000Z",
+  "data": {
+    "platform": "google_meet",
+    "nativeMeetingId": "abc-defg-hij",
+    "title": "Weekly Standup",
+    "status": "active",
+    "botName": "MeetBot"
+  }
+}
+```
+
+### Verifying Signatures
+
+```javascript
+const crypto = require("crypto");
+
+function verifyWebhookSignature(body, signature, secret) {
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(body)
+    .digest("hex");
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expected)
+  );
+}
+```
+
+---
+
+## Admin
+
+MeetBot includes an admin system for managing users and app-wide settings.
+
+### Admin Account
+
+An admin account is automatically seeded on first startup using the `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and `ADMIN_NAME` environment variables. This account has full access to admin endpoints.
+
+### User Management
+
+Admins can:
+
+- **List all users** -- view all registered accounts
+- **Enable / disable accounts** -- disabled users cannot log in or use the API
+- **Promote / demote users** -- grant or revoke admin privileges
+
+### Registration Toggle
+
+Admins can enable or disable new user registration at any time via the admin settings endpoint or dashboard. When disabled, the `POST /auth/register` endpoint returns a `403` error, and the frontend hides the registration form. The current status is publicly queryable via `GET /auth/registration-status`.
+
+---
+
+## Bot Auto-Exit
+
+MeetBot supports automatic bot exit when the bot is the only participant remaining in a meeting.
+
+- **Configurable timeout** -- set the number of minutes the bot waits alone before leaving (default: 5 minutes, range: 1--30 minutes)
+- **Per-user setting** -- each user can configure this value in the Settings page or via `PATCH /settings`
+- **Behavior** -- when all other participants leave, a countdown begins. If someone rejoins, the countdown resets. If the timeout expires, the bot leaves and the meeting status is updated to `completed`.
+
+---
+
 ## Design System
 
 MeetBot uses a custom dark theme with glass-morphism effects. Below is the color palette:
@@ -431,6 +589,7 @@ MeetBot uses a custom dark theme with glass-morphism effects. Below is the color
 | `npm run start:dev` | Start with hot reload (watch mode) |
 | `npm run build` | Compile TypeScript for production |
 | `npm run start:prod` | Start the production server |
+| `npm run gen:auth` | Launch browser to authenticate the bot's Google account |
 
 ### Frontend (`/frontend`)
 
@@ -450,10 +609,12 @@ MeetBot uses **SQLite** for zero-configuration local development. The database a
 
 | Entity | Description |
 |---|---|
-| `User` | User accounts with hashed passwords |
+| `User` | User accounts with hashed passwords and role (user/admin) |
 | `Meeting` | Meeting records with platform and status tracking |
 | `TranscriptSegment` | Individual transcript segments linked to meetings |
 | `ApiKey` | Hashed API keys associated with users |
+| `Webhook` | Webhook configurations with URL, secret, events, and custom headers |
+| `AppSettings` | Application-wide settings (e.g., registration toggle) |
 
 ### Meeting Status Flow
 
@@ -467,11 +628,12 @@ requested -> joining -> awaiting_admission -> active -> stopping -> completed
 
 ## Roadmap
 
-- [ ] Implement actual Puppeteer bot for Google Meet joining
-- [ ] Integrate Google Cloud Speech-to-Text for real transcription
+- [x] Implement Playwright bot for Google Meet joining
+- [x] Real transcription via Google Meet caption scraping
+- [x] Implement webhook notifications
+- [x] Admin user management
 - [ ] Add Microsoft Teams support
 - [ ] Add Zoom support
-- [ ] Implement webhook notifications
 - [ ] Add recording / playback support
 - [ ] PostgreSQL support for production deployments
 - [ ] Rate limiting and throttling
@@ -501,5 +663,5 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 ---
 
 <p align="center">
-  Built with NestJS, Next.js, and a lot of caffeine.
+  Built with NestJS, Next.js, Playwright, and a lot of caffeine.
 </p>

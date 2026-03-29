@@ -43,6 +43,15 @@ export class AuthController {
       id: user.id,
       email: user.email,
       name: user.name,
+      role: user.role,
     };
+  }
+
+  @Get('registration-status')
+  @ApiOperation({ summary: 'Check if registration is enabled' })
+  @ApiResponse({ status: 200, description: 'Returns registration status' })
+  async getRegistrationStatus() {
+    const enabled = await this.authService.isRegistrationEnabled();
+    return { registrationEnabled: enabled };
   }
 }

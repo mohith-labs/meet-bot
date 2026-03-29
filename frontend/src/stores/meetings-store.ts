@@ -46,20 +46,12 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
   },
 
   deleteMeeting: async (platform: string, nativeMeetingId: string) => {
-    try {
-      await api.deleteMeeting(platform, nativeMeetingId);
-      set((state) => ({
-        meetings: state.meetings.filter(
-          (m) =>
-            !(m.platform === platform && m.nativeMeetingId === nativeMeetingId)
-        ),
-      }));
-    } catch (err) {
-      set({
-        error:
-          err instanceof Error ? err.message : "Failed to delete meeting",
-      });
-    }
+    await api.deleteMeeting(platform, nativeMeetingId);
+    // Re-fetch from the server to get the accurate list
+    // (filtering locally by platform+nativeMeetingId is unsafe because
+    //  multiple meetings can share the same meeting code)
+    const meetings = await api.listMeetings();
+    set({ meetings });
   },
 
   reset: () => {

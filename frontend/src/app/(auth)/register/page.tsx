@@ -1,12 +1,13 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState, useEffect, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Mail, Lock, User } from "lucide-react";
+import { Mail, Lock, User, ShieldOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useAuthStore } from "@/stores/auth-store";
+import { api } from "@/lib/api";
 import toast from "react-hot-toast";
 
 export default function RegisterPage() {
@@ -18,6 +19,23 @@ export default function RegisterPage() {
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
+  const [registrationEnabled, setRegistrationEnabled] = useState<boolean | null>(null);
+  const [isCheckingRegistration, setIsCheckingRegistration] = useState(true);
+
+  useEffect(() => {
+    const checkRegistration = async () => {
+      try {
+        const result = await api.getRegistrationStatus();
+        setRegistrationEnabled(result.registrationEnabled);
+      } catch {
+        // If we can't check, assume enabled to not block users unnecessarily
+        setRegistrationEnabled(true);
+      } finally {
+        setIsCheckingRegistration(false);
+      }
+    };
+    checkRegistration();
+  }, []);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -43,6 +61,45 @@ export default function RegisterPage() {
       setIsLoading(false);
     }
   };
+
+  if (isCheckingRegistration) {
+    return (
+      <div className="bg-bg-card/80 backdrop-blur-xl border border-border rounded-2xl p-8 shadow-2xl">
+        <div className="flex items-center justify-center py-12">
+          <div className="h-6 w-6 border-2 border-brand-primary border-t-transparent rounded-full animate-spin" />
+        </div>
+      </div>
+    );
+  }
+
+  if (registrationEnabled === false) {
+    return (
+      <div className="bg-bg-card/80 backdrop-blur-xl border border-border rounded-2xl p-8 shadow-2xl">
+        <div className="absolute inset-x-0 -top-px h-px bg-gradient-to-r from-transparent via-brand-primary to-transparent" />
+
+        <div className="text-center py-6">
+          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-amber-500/10 border border-amber-500/20">
+            <ShieldOff className="h-7 w-7 text-amber-400" />
+          </div>
+          <h1 className="text-2xl font-bold text-text-primary mb-2">
+            Registration is currently disabled
+          </h1>
+          <p className="text-sm text-text-secondary max-w-sm mx-auto">
+            Please contact an administrator to get access.
+          </p>
+        </div>
+
+        <div className="mt-6 text-center">
+          <Link
+            href="/login"
+            className="inline-flex items-center gap-2 text-sm text-brand-primary hover:text-brand-secondary font-medium transition-colors"
+          >
+            Back to sign in
+          </Link>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-bg-card/80 backdrop-blur-xl border border-border rounded-2xl p-8 shadow-2xl">
