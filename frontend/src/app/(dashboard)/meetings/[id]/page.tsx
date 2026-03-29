@@ -27,7 +27,15 @@ import {
   type MeetingStatus,
   type TranscriptSegment,
 } from "@/lib/api";
-import { type TranscriptEntry, useLiveTranscripts } from "@/hooks/use-live-transcripts";
+interface TranscriptEntry {
+  id: string;
+  speaker: string;
+  text: string;
+  startTime: number;
+  endTime: number;
+  absoluteStartTime: number;
+  isFinal: boolean;
+}
 import { formatDuration, cn } from "@/lib/utils";
 import toast from "react-hot-toast";
 
@@ -68,8 +76,7 @@ export default function MeetingDetailPage() {
     meeting?.status === "joining" ||
     meeting?.status === "awaiting_admission";
 
-  const { groupedTranscripts, isConnected, subscribeToMeeting } =
-    useLiveTranscripts(isLive ? meetingId : null);
+  // Live transcript feature removed — transcripts are saved after the call ends
 
   // Load meeting by first fetching all meetings to find UUID -> platform/nativeMeetingId mapping
   useEffect(() => {
@@ -106,11 +113,15 @@ export default function MeetingDetailPage() {
     loadMeeting();
   }, [meetingId]);
 
+  // Refresh transcript when meeting completes
   useEffect(() => {
-    if (isLive && meetingId) {
-      subscribeToMeeting(meetingId);
+    if (meeting?.status === 'completed' && segments.length === 0) {
+      // Re-fetch transcript after meeting completes
+      api.getTranscript(meeting.platform, meeting.nativeMeetingId)
+        .then((data) => setSegments(data.segments))
+        .catch(() => {});
     }
-  }, [isLive, meetingId, subscribeToMeeting]);
+  }, [meeting?.status, meeting?.platform, meeting?.nativeMeetingId, segments.length]);
 
   const handleStop = async () => {
     if (!meeting) return;
@@ -196,13 +207,9 @@ export default function MeetingDetailPage() {
   const durationSecs = calcDurationSeconds(meeting.startTime, meeting.endTime);
   const displayTime = meeting.startTime || meeting.createdAt;
 
-  // Merge static segments with live grouped transcripts
+  // Group static segments for display (live transcription removed)
   const displayTranscripts =
-    isLive && groupedTranscripts.length > 0
-      ? groupedTranscripts
-      : segments.length > 0
-        ? groupSegments(segments)
-        : [];
+    segments.length > 0 ? groupSegments(segments) : [];
 
   return (
     <div className="space-y-6">
@@ -229,9 +236,9 @@ export default function MeetingDetailPage() {
             >
               {meeting.status}
             </Badge>
-            {isLive && isConnected && (
-              <Badge variant="success" dot pulse>
-                Live
+            {isLive && (
+              <Badge variant="info" dot pulse>
+                In Progress
               </Badge>
             )}
           </div>
@@ -378,13 +385,13 @@ export default function MeetingDetailPage() {
               title="No transcript yet"
               description={
                 isLive
-                  ? "Transcript will appear here as the meeting progresses"
+                  ? "Transcript will be available once the meeting ends"
                   : "No transcript segments available for this meeting"
               }
             />
           ) : (
             <div className="space-y-4">
-              {displayTranscripts.map((group, index) => (
+              {displayTranscripts.map((group: GroupedSegment, index: number) => (
                 <div key={index} className="flex gap-4">
                   <div className="flex-shrink-0 w-28 pt-0.5">
                     <p className="text-sm font-medium text-brand-secondary truncate">
@@ -395,14 +402,10 @@ export default function MeetingDetailPage() {
                     </p>
                   </div>
                   <div className="flex-1 text-sm text-text-primary leading-relaxed">
-                    {group.entries.map((entry, i) => (
+                    {group.entries.map((entry: TranscriptSegment | TranscriptEntry, i: number) => (
                       <span
                         key={entry.id || i}
-                        className={cn(
-                          "isFinal" in entry &&
-                            !entry.isFinal &&
-                            "text-text-secondary italic"
-                        )}
+                        className="text-text-primary"
                       >
                         {entry.text}{" "}
                       </span>

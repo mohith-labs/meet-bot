@@ -28,6 +28,10 @@ interface ActiveBot {
   endMonitorInterval?: NodeJS.Timeout;
   hardTimeoutTimer?: NodeJS.Timeout;
   isRunning: boolean;
+  /** Current unfinalised caption state, updated by the scraping closure */
+  currentSpeaker: string;
+  currentText: string;
+  segmentTimestamp: Date;
 }
 
 @Injectable()
@@ -39,9 +43,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
   /** Hard timeout for meetings: 100 minutes */
   private readonly HARD_TIMEOUT_MS = 100 * 60 * 1000;
-
-  /** Caption flush interval: how often to check for stale segments */
-  private readonly FLUSH_INTERVAL_MS = 2000;
 
   constructor(private configService: ConfigService) {}
 
@@ -111,6 +112,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         page,
         emitter,
         isRunning: true,
+        currentSpeaker: '',
+        currentText: '',
+        segmentTimestamp: new Date(),
       };
       this.activeBots.set(meetingKey, bot);
 
@@ -672,11 +676,41 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       return;
     }
 
-    // Step 2: Track state in Node
-    let currentSpeaker = '';
-    let currentText = '';
-    let lastChangeTime = Date.now();
-    const FINALIZE_AFTER_MS = 2000;
+    // Step 2: Caption state is stored on the bot object (not closure vars)
+    // so that bots.service.ts can read it via getRemainingCaption() before
+    // saving the transcript buffer.
+    //
+    // KEY DESIGN: Google Meet captions are live speech-to-text that REVISE
+    // earlier text as more context arrives. For example:
+    //   "Hello" → "Hello. How" → "Hello. How?" → "Hello. How are you?"
+    // The "?" after "How" was an interim guess that gets corrected.
+    //
+    // We NEVER finalize based on text changes or timeouts.
+    // We only finalize a segment when:
+    //   1. The SPEAKER changes (a different person starts talking)
+    //   2. Google Meet RESETS the caption bubble (new text is much shorter)
+    //   3. The meeting ends (bots.service.ts calls getRemainingCaption)
+
+    // System phrases to filter out (Google Meet accessibility announcements)
+    const SYSTEM_PHRASES = [
+      'you have joined',
+      'joined the call',
+      'other person',
+      'people in the call',
+      'camera is turned',
+      'microphone is turned',
+      'hand is lowered',
+      'hand is raised',
+      'is presenting',
+      'left the meeting',
+      'return to home',
+      'leave call',
+      'feedback',
+      'audio and video',
+      'learn more',
+      'recording',
+      'transcript',
+    ];
 
     // Step 3: Expose the bridge function BEFORE injecting the observer
     try {
@@ -685,106 +719,75 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         (speaker: string, text: string) => {
           if (!bot.isRunning) return;
 
-          const cleanSpeaker = (speaker || '').trim() || currentSpeaker || 'Unknown';
+          const cleanSpeaker = (speaker || '').trim() || bot.currentSpeaker || 'Unknown';
           const cleanText = (text || '').trim();
           if (!cleanText || cleanText.length < 2) return;
 
-          // Filter out Google Meet system/status messages
-          const systemPhrases = [
-            'you have joined',
-            'joined the call',
-            'other person',
-            'camera is turned',
-            'microphone is turned',
-            'hand is lowered',
-            'hand is raised',
-            'is presenting',
-            'left the meeting',
-            'return to home',
-            'leave call',
-            'feedback',
-            'audio and video',
-            'learn more',
-            'recording',
-            'transcript',
-          ];
+          // Filter system messages
           const lower = cleanText.toLowerCase();
-          if (systemPhrases.some((p) => lower.includes(p))) return;
+          if (SYSTEM_PHRASES.some((p) => lower.includes(p))) return;
 
-          const now = Date.now();
+          // Exact duplicate — skip
+          if (cleanText === bot.currentText && cleanSpeaker === bot.currentSpeaker) return;
+
           const speakerChanged =
-            currentSpeaker !== '' && cleanSpeaker !== currentSpeaker;
-          const textChanged = cleanText !== currentText;
+            bot.currentSpeaker !== '' && cleanSpeaker !== bot.currentSpeaker;
 
-          if (!textChanged && !speakerChanged) return; // Exact duplicate
-
-          // Speaker changed — finalize the previous speaker's segment
-          if (speakerChanged && currentText) {
+          // ── Speaker changed → finalize previous segment ──
+          if (speakerChanged && bot.currentText) {
             emitter.emit('caption', {
-              speaker: currentSpeaker,
-              text: currentText,
-              timestamp: new Date(),
+              speaker: bot.currentSpeaker,
+              text: bot.currentText,
+              timestamp: bot.segmentTimestamp,
               isFinal: true,
             } as CaptionEvent);
             this.logger.debug(
-              `[Final] [${currentSpeaker}] "${currentText}"`,
+              `[Final/SpeakerChange] [${bot.currentSpeaker}] "${bot.currentText}"`,
             );
-            currentSpeaker = '';
-            currentText = '';
+            // Start fresh for the new speaker
+            bot.currentSpeaker = cleanSpeaker;
+            bot.currentText = cleanText;
+            bot.segmentTimestamp = new Date();
+            return;
           }
 
-          if (speakerChanged || !currentText) {
-            // New speaker or first segment
-            currentSpeaker = cleanSpeaker;
-            currentText = cleanText;
-            lastChangeTime = now;
+          // ── Same speaker (or first caption) ──
+          if (!bot.currentText) {
+            bot.currentSpeaker = cleanSpeaker;
+            bot.currentText = cleanText;
+            bot.segmentTimestamp = new Date();
+            return;
+          }
+
+          // Check if this is a caption RESET (Google cleared the bubble and
+          // started a new one). A reset means the new text is significantly
+          // shorter and does NOT begin with the start of the old text.
+          const isReset =
+            cleanText.length < bot.currentText.length * 0.5 &&
+            !cleanText.startsWith(
+              bot.currentText.substring(0, Math.min(10, bot.currentText.length)),
+            );
+
+          if (isReset) {
             emitter.emit('caption', {
-              speaker: cleanSpeaker,
-              text: cleanText,
-              timestamp: new Date(),
-              isFinal: false,
+              speaker: bot.currentSpeaker,
+              text: bot.currentText,
+              timestamp: bot.segmentTimestamp,
+              isFinal: true,
             } as CaptionEvent);
-          } else if (textChanged) {
-            // Same speaker, text changed
-            const isGrowing =
-              cleanText.length > currentText.length &&
-              cleanText.startsWith(
-                currentText.substring(0, Math.min(15, currentText.length)),
-              );
-
-            if (isGrowing) {
-              // Caption extending
-              currentText = cleanText;
-              lastChangeTime = now;
-              emitter.emit('caption', {
-                speaker: currentSpeaker,
-                text: cleanText,
-                timestamp: new Date(),
-                isFinal: false,
-              } as CaptionEvent);
-            } else {
-              // Completely new text — finalize old, start new
-              if (currentText) {
-                emitter.emit('caption', {
-                  speaker: currentSpeaker,
-                  text: currentText,
-                  timestamp: new Date(),
-                  isFinal: true,
-                } as CaptionEvent);
-                this.logger.debug(
-                  `[Final] [${currentSpeaker}] "${currentText}"`,
-                );
-              }
-              currentText = cleanText;
-              lastChangeTime = now;
-              emitter.emit('caption', {
-                speaker: currentSpeaker,
-                text: cleanText,
-                timestamp: new Date(),
-                isFinal: false,
-              } as CaptionEvent);
-            }
+            this.logger.debug(
+              `[Final/Reset] [${bot.currentSpeaker}] "${bot.currentText}"`,
+            );
+            bot.currentSpeaker = cleanSpeaker;
+            bot.currentText = cleanText;
+            bot.segmentTimestamp = new Date();
+            return;
           }
+
+          // Otherwise: same speaker, text is being revised or extended.
+          // ALWAYS take the latest version from Google's recognizer.
+          bot.currentSpeaker = cleanSpeaker;
+          bot.currentText = cleanText;
         },
       );
     } catch (err: any) {
@@ -940,24 +943,10 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       this.logger.warn(`Failed to inject observer: ${err.message}`);
     }
 
-    // Step 5: Finalize timer — if no change for 2s, emit isFinal
-    bot.flushInterval = setInterval(() => {
-      if (!bot.isRunning) {
-        if (bot.flushInterval) clearInterval(bot.flushInterval);
-        return;
-      }
-      if (currentText && Date.now() - lastChangeTime >= FINALIZE_AFTER_MS) {
-        emitter.emit('caption', {
-          speaker: currentSpeaker,
-          text: currentText,
-          timestamp: new Date(),
-          isFinal: true,
-        } as CaptionEvent);
-        this.logger.debug(`[Final/Timeout] [${currentSpeaker}] "${currentText}"`);
-        currentSpeaker = '';
-        currentText = '';
-      }
-    }, FINALIZE_AFTER_MS);
+    // Step 5: No timer-based finalization. The remaining caption is stored
+    // on bot.currentText and will be retrieved by bots.service.ts via
+    // getRemainingCaption() BEFORE saving the transcript buffer.
+    this.logger.log('Caption scraping active — segments will be saved when meeting ends');
   }
 
   // ---------------------------------------------------------------------------
@@ -1063,6 +1052,33 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
     this.activeBots.delete(meetingKey);
     this.logger.log(`Bot stopped for meeting ${meetingKey}`);
+  }
+
+  /**
+   * Get and clear any remaining unfinalised caption from the bot.
+   * Must be called BEFORE saveBufferedTranscripts to avoid losing
+   * the last segment (especially for single-speaker meetings).
+   */
+  getRemainingCaption(meetingKey: string): CaptionEvent | null {
+    const bot = this.activeBots.get(meetingKey);
+    if (!bot || !bot.currentText) return null;
+
+    const caption: CaptionEvent = {
+      speaker: bot.currentSpeaker || 'Unknown',
+      text: bot.currentText,
+      timestamp: bot.segmentTimestamp,
+      isFinal: true,
+    };
+
+    this.logger.debug(
+      `[Final/Flush] [${bot.currentSpeaker}] "${bot.currentText}"`,
+    );
+
+    // Clear so it's not returned again
+    bot.currentSpeaker = '';
+    bot.currentText = '';
+
+    return caption;
   }
 
   /**

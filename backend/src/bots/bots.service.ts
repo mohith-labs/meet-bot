@@ -32,12 +32,10 @@ export class BotsService {
   private readonly meetingStartTimes = new Map<string, Date>();
 
   /**
-   * Tracks the absoluteStartTime (epoch ms) for the current active segment
-   * per meeting. Keyed by meetingId. When a new interim caption arrives for
-   * the first time (or after a final), we record Date.now(). Subsequent
-   * interim updates for the same speaker reuse this value.
+   * Accumulates final caption entries in memory per meeting.
+   * Flushed to the database when the meeting ends or the bot is stopped.
    */
-  private readonly activeSegmentStartTimes = new Map<string, number>();
+  private readonly transcriptBuffers = new Map<string, Array<{ speaker: string; text: string; timestamp: Date }>>();
 
   constructor(
     @InjectRepository(Meeting)
@@ -230,81 +228,22 @@ export class BotsService {
     meetingKey: string,
     caption: CaptionEvent,
   ): Promise<void> {
-    // Track absoluteStartTime: record Date.now() when the first interim
-    // arrives for a segment; reuse it for subsequent interims and the final.
-    if (!this.activeSegmentStartTimes.has(meetingId)) {
-      this.activeSegmentStartTimes.set(meetingId, Date.now());
-    }
-    const absoluteStartTime = this.activeSegmentStartTimes.get(meetingId)!;
+    // Only accumulate final captions
+    if (!caption.isFinal) return;
 
-    // Only persist final captions to the database
-    if (!caption.isFinal) {
-      // Broadcast interim captions to WebSocket (live preview), but don't save
-      this.broadcastTranscript(meetingId, meetingKey, {
-        id: `interim-${absoluteStartTime}`,
-        text: caption.text,
-        speaker: caption.speaker,
-        language: 'en',
-        startTime: 0,
-        endTime: 0,
-        absoluteStartTime,
-        isFinal: false,
-      });
-      return;
+    if (!this.transcriptBuffers.has(meetingId)) {
+      this.transcriptBuffers.set(meetingId, []);
     }
 
-    // Final caption — clear the tracked start time so the next segment gets a fresh one
-    this.activeSegmentStartTimes.delete(meetingId);
+    this.transcriptBuffers.get(meetingId)!.push({
+      speaker: caption.speaker || 'Unknown',
+      text: caption.text,
+      timestamp: caption.timestamp,
+    });
 
-    // Calculate relative times from meeting start
-    const meetingStart = this.meetingStartTimes.get(meetingId);
-    const now = new Date();
-
-    let startTime = 0;
-    let endTime = 0;
-    if (meetingStart) {
-      endTime = (now.getTime() - meetingStart.getTime()) / 1000;
-      startTime = Math.max(
-        0,
-        (absoluteStartTime - meetingStart.getTime()) / 1000,
-      );
-    }
-
-    try {
-      const segment = this.transcriptSegmentsRepository.create({
-        meetingId,
-        text: caption.text,
-        speaker: caption.speaker || 'Unknown',
-        language: 'en',
-        startTime,
-        endTime,
-        absoluteStartTime: new Date(absoluteStartTime),
-        absoluteEndTime: now,
-        completed: true,
-      });
-
-      const saved = await this.transcriptSegmentsRepository.save(segment);
-
-      this.logger.log(
-        `Transcript saved for ${meetingId}: [${caption.speaker}] "${caption.text}"`,
-      );
-
-      // Broadcast final caption to WebSocket subscribers
-      this.broadcastTranscript(meetingId, meetingKey, {
-        id: saved.id,
-        text: saved.text,
-        speaker: saved.speaker,
-        language: saved.language,
-        startTime: saved.startTime,
-        endTime: saved.endTime,
-        absoluteStartTime,
-        isFinal: true,
-      });
-    } catch (error) {
-      this.logger.error(
-        `Failed to save transcript segment for ${meetingId}: ${error.message}`,
-      );
-    }
+    this.logger.log(
+      `Caption buffered for ${meetingId}: [${caption.speaker}] "${caption.text}"`,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -316,13 +255,18 @@ export class BotsService {
     meetingKey: string,
   ): Promise<void> {
     try {
+      // Flush any remaining caption from the bot BEFORE saving
+      this.flushRemainingCaption(meetingId);
+
+      // Save all accumulated transcript segments
+      await this.saveBufferedTranscripts(meetingId);
+
       await this.meetingsRepository.update(meetingId, {
         status: MeetingStatus.COMPLETED,
         endTime: new Date(),
       });
 
       this.meetingStartTimes.delete(meetingId);
-      this.activeSegmentStartTimes.delete(meetingId);
       this.broadcastStatus(meetingId, meetingKey, MeetingStatus.COMPLETED);
     } catch (error) {
       this.logger.error(
@@ -365,7 +309,14 @@ export class BotsService {
     await this.meetingsRepository.save(meeting);
     this.broadcastStatus(meeting.id, meetingKey, MeetingStatus.STOPPING);
 
-    // Actually stop the Playwright browser
+    // Flush remaining caption BEFORE stopping the browser (stopBot deletes
+    // the bot from the activeBots map, making getRemainingCaption return null)
+    this.flushRemainingCaption(meeting.id);
+
+    // Save all accumulated transcript segments
+    await this.saveBufferedTranscripts(meeting.id);
+
+    // NOW stop the Playwright browser (safe — captions already saved)
     try {
       await this.googleMeetBotService.stopBot(meeting.id);
     } catch (error) {
@@ -380,7 +331,6 @@ export class BotsService {
     await this.meetingsRepository.save(meeting);
 
     this.meetingStartTimes.delete(meeting.id);
-    this.activeSegmentStartTimes.delete(meeting.id);
     this.broadcastStatus(meeting.id, meetingKey, MeetingStatus.COMPLETED);
 
     this.logger.log(`Bot stopped for meeting ${platform}/${nativeMeetingId}`);
@@ -483,37 +433,74 @@ export class BotsService {
     }
   }
 
-  private broadcastTranscript(
-    meetingId: string,
-    meetingKey: string,
-    segment: {
-      id: string;
-      text: string;
-      speaker: string;
-      language: string;
-      startTime: number;
-      endTime: number;
-      absoluteStartTime: number;
-      isFinal: boolean;
-    },
-  ): void {
-    try {
-      if (segment.isFinal) {
-        const finalSegment = segment as typeof segment & { isFinal: true };
-        // Broadcast to subscribers by meeting UUID
-        this.transcriptGateway.broadcastTranscriptFinal(meetingId, finalSegment);
-        // Also broadcast to subscribers by platform/nativeMeetingId key
-        this.transcriptGateway.broadcastTranscriptFinal(meetingKey, finalSegment);
-      } else {
-        const mutableSegment = segment as typeof segment & { isFinal: false };
-        // Broadcast to subscribers by meeting UUID
-        this.transcriptGateway.broadcastTranscriptMutable(meetingId, mutableSegment);
-        // Also broadcast to subscribers by platform/nativeMeetingId key
-        this.transcriptGateway.broadcastTranscriptMutable(meetingKey, mutableSegment);
+  /**
+   * Pull any remaining unfinalised caption from the bot and add it to the buffer.
+   * Must be called synchronously BEFORE saveBufferedTranscripts.
+   */
+  private flushRemainingCaption(meetingId: string): void {
+    const remaining = this.googleMeetBotService.getRemainingCaption(meetingId);
+    if (remaining) {
+      if (!this.transcriptBuffers.has(meetingId)) {
+        this.transcriptBuffers.set(meetingId, []);
       }
-    } catch (error) {
-      this.logger.warn(`Failed to broadcast transcript: ${error.message}`);
+      this.transcriptBuffers.get(meetingId)!.push({
+        speaker: remaining.speaker || 'Unknown',
+        text: remaining.text,
+        timestamp: remaining.timestamp,
+      });
+      this.logger.log(
+        `Flushed remaining caption for ${meetingId}: [${remaining.speaker}] "${remaining.text}"`,
+      );
     }
+  }
+
+  private async saveBufferedTranscripts(meetingId: string): Promise<void> {
+    const buffer = this.transcriptBuffers.get(meetingId);
+    if (!buffer || buffer.length === 0) {
+      this.logger.log(`No transcript segments to save for meeting ${meetingId}`);
+      this.transcriptBuffers.delete(meetingId);
+      return;
+    }
+
+    const meetingStart = this.meetingStartTimes.get(meetingId);
+
+    try {
+      const segments = buffer.map((entry, index) => {
+        let startTime = 0;
+        let endTime = 0;
+        if (meetingStart) {
+          startTime = (entry.timestamp.getTime() - meetingStart.getTime()) / 1000;
+          // Estimate end time as start of next segment, or +3s for last segment
+          const nextEntry = buffer[index + 1];
+          endTime = nextEntry
+            ? (nextEntry.timestamp.getTime() - meetingStart.getTime()) / 1000
+            : startTime + 3;
+        }
+
+        return this.transcriptSegmentsRepository.create({
+          meetingId,
+          text: entry.text,
+          speaker: entry.speaker,
+          language: 'en',
+          startTime,
+          endTime,
+          absoluteStartTime: entry.timestamp,
+          absoluteEndTime: new Date(entry.timestamp.getTime() + (endTime - startTime) * 1000),
+          completed: true,
+        });
+      });
+
+      await this.transcriptSegmentsRepository.save(segments);
+      this.logger.log(
+        `Saved ${segments.length} transcript segments for meeting ${meetingId}`,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Failed to save transcript buffer for ${meetingId}: ${error.message}`,
+      );
+    }
+
+    this.transcriptBuffers.delete(meetingId);
   }
 
   // ---------------------------------------------------------------------------
@@ -529,8 +516,10 @@ export class BotsService {
       const update: Partial<Meeting> = { status };
       if (status === MeetingStatus.COMPLETED || status === MeetingStatus.FAILED) {
         update.endTime = new Date();
+        // Try to save any accumulated transcripts before cleanup
+        this.flushRemainingCaption(meetingId);
+        await this.saveBufferedTranscripts(meetingId);
         this.meetingStartTimes.delete(meetingId);
-        this.activeSegmentStartTimes.delete(meetingId);
       }
       await this.meetingsRepository.update(meetingId, update);
       this.broadcastStatus(meetingId, meetingKey, status);
