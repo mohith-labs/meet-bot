@@ -27,6 +27,7 @@ interface ActiveBot {
   flushInterval?: NodeJS.Timeout;
   endMonitorInterval?: NodeJS.Timeout;
   participantMonitorInterval?: NodeJS.Timeout;
+  captionHealthInterval?: NodeJS.Timeout;
   hardTimeoutTimer?: NodeJS.Timeout;
   isRunning: boolean;
   /** Number of minutes the bot waits alone before auto-exiting (0 = disabled) */
@@ -35,6 +36,8 @@ interface ActiveBot {
   currentSpeaker: string;
   currentText: string;
   segmentTimestamp: Date;
+  /** Tracks how many times the observer has been (re-)attached */
+  observerGeneration: number;
 }
 
 @Injectable()
@@ -121,6 +124,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         currentSpeaker: '',
         currentText: '',
         segmentTimestamp: new Date(),
+        observerGeneration: 0,
       };
       this.activeBots.set(meetingKey, bot);
 
@@ -764,6 +768,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
   // Caption scraping (Recall.ai approach: exposeFunction + MutationObserver)
   // ---------------------------------------------------------------------------
 
+  /** Maximum seconds a single speaker segment can accumulate before forced finalization */
+  private readonly CAPTION_FINALIZE_INTERVAL_SEC = 30;
+
   private async startCaptionScraping(
     page: Page,
     meetingKey: string,
@@ -784,7 +791,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     // Step 1: Wait for the specific Captions region
     this.logger.log('Waiting for Captions region to appear...');
     try {
-      // The captions region has aria-label="Captions" (exact) or contains "aption"
       await page.waitForSelector(
         '[role="region"][aria-label*="aption" i]',
         { timeout: 60_000 },
@@ -796,21 +802,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       );
       return;
     }
-
-    // Step 2: Caption state is stored on the bot object (not closure vars)
-    // so that bots.service.ts can read it via getRemainingCaption() before
-    // saving the transcript buffer.
-    //
-    // KEY DESIGN: Google Meet captions are live speech-to-text that REVISE
-    // earlier text as more context arrives. For example:
-    //   "Hello" → "Hello. How" → "Hello. How?" → "Hello. How are you?"
-    // The "?" after "How" was an interim guess that gets corrected.
-    //
-    // We NEVER finalize based on text changes or timeouts.
-    // We only finalize a segment when:
-    //   1. The SPEAKER changes (a different person starts talking)
-    //   2. Google Meet RESETS the caption bubble (new text is much shorter)
-    //   3. The meeting ends (bots.service.ts calls getRemainingCaption)
 
     // System phrases to filter out (Google Meet accessibility announcements)
     const SYSTEM_PHRASES = [
@@ -833,7 +824,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       'transcript',
     ];
 
-    // Step 3: Expose the bridge function BEFORE injecting the observer
+    // Step 2: Expose the bridge function BEFORE injecting the observer
     try {
       await page.exposeFunction(
         '__meetbot_onCaption',
@@ -865,7 +856,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
             this.logger.debug(
               `[Final/SpeakerChange] [${bot.currentSpeaker}] "${bot.currentText}"`,
             );
-            // Start fresh for the new speaker
             bot.currentSpeaker = cleanSpeaker;
             bot.currentText = cleanText;
             bot.segmentTimestamp = new Date();
@@ -916,20 +906,96 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       return;
     }
 
-    // Step 4: Inject MutationObserver scoped to the Captions region ONLY
+    // Step 3: Inject MutationObserver (will be called on each health-check too)
+    await this.injectCaptionObserver(page, meetingKey);
+
+    // Step 4: Periodic finalization — force-finalize segments that have been
+    // accumulating for too long from a single speaker. This prevents data loss
+    // if the captions region is recreated and the old text is never reset.
+    const finalizeIntervalMs = this.CAPTION_FINALIZE_INTERVAL_SEC * 1000;
+    bot.flushInterval = setInterval(() => {
+      if (!bot.isRunning || !bot.currentText) return;
+      const age = Date.now() - bot.segmentTimestamp.getTime();
+      if (age >= finalizeIntervalMs) {
+        emitter.emit('caption', {
+          speaker: bot.currentSpeaker || 'Unknown',
+          text: bot.currentText,
+          timestamp: bot.segmentTimestamp,
+          isFinal: true,
+        } as CaptionEvent);
+        this.logger.debug(
+          `[Final/Periodic] [${bot.currentSpeaker}] "${bot.currentText}"`,
+        );
+        // Reset — the next incoming caption will start a fresh segment
+        bot.currentSpeaker = '';
+        bot.currentText = '';
+        bot.segmentTimestamp = new Date();
+      }
+    }, 10_000); // check every 10s
+
+    // Step 5: Caption health-check — periodically verify the observed Captions
+    // region is still in the live DOM. Google Meet can recreate it when
+    // participants join/leave or after prolonged use.
+    bot.captionHealthInterval = setInterval(async () => {
+      if (!bot.isRunning) return;
+      try {
+        const isHealthy = await page.evaluate(() => {
+          return !!(window as any).__meetbot_observerAttached;
+        });
+        if (!isHealthy) {
+          this.logger.warn(
+            `Caption observer appears detached for ${meetingKey} — re-attaching...`,
+          );
+          await this.injectCaptionObserver(page, meetingKey);
+        }
+      } catch {
+        // Page may be closed — ignore
+      }
+    }, 10_000); // check every 10s
+
+    this.logger.log('Caption scraping active with health monitoring');
+  }
+
+  /**
+   * Inject (or re-inject) the MutationObserver into the live Captions region.
+   * Safe to call multiple times — it disconnects any previous observer first.
+   */
+  private async injectCaptionObserver(
+    page: Page,
+    meetingKey: string,
+  ): Promise<void> {
+    const bot = this.activeBots.get(meetingKey);
+    if (!bot) return;
+
+    bot.observerGeneration++;
+    const generation = bot.observerGeneration;
+
     try {
-      await page.evaluate(() => {
+      const attached = await page.evaluate(() => {
+        // Disconnect any previous observer
+        if ((window as any).__meetbot_observer) {
+          (window as any).__meetbot_observer.disconnect();
+          (window as any).__meetbot_observer = null;
+        }
+        (window as any).__meetbot_observerAttached = false;
+
         // Find the EXACT captions region — NOT the generic [aria-live] status areas
         const captionsRegion = document.querySelector<HTMLElement>(
           '[role="region"][aria-label*="aption" i]',
         );
         if (!captionsRegion) {
-          console.error('[MeetBot] Captions region not found');
-          return;
+          console.error('[MeetBot] Captions region not found for (re-)attach');
+          return false;
+        }
+
+        // Verify the region is still connected to the live DOM
+        if (!captionsRegion.isConnected) {
+          console.error('[MeetBot] Captions region found but not connected to DOM');
+          return false;
         }
 
         console.log(
-          '[MeetBot] Observing captions region:',
+          '[MeetBot] (Re-)attaching observer to captions region:',
           captionsRegion.getAttribute('aria-label'),
         );
 
@@ -937,21 +1003,12 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         let lastText = '';
 
         // Extract speaker + text from a caption entry node.
-        // Google Meet caption entries typically look like:
-        //   <div>
-        //     <div><img ...><span>Speaker Name</span></div>
-        //     <div><span>Caption text words...</span></div>
-        //   </div>
-        // But the exact structure changes. We use a heuristic:
-        // walk the children, find the first short text (<40 chars) that
-        // is NOT the entire text content — that's the speaker name.
         const extractFromNode = (
           node: HTMLElement,
         ): { speaker: string; text: string } | null => {
           const fullText = node.textContent?.trim() || '';
           if (!fullText || fullText.length < 2) return null;
 
-          // Try to find speaker from child structure
           let speaker = '';
           let captionText = fullText;
 
@@ -966,7 +1023,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
           if (directChildren.length >= 2) {
             for (const child of directChildren) {
               const ct = child.textContent?.trim() || '';
-              // A speaker label is short and not the full text
               if (
                 ct.length > 0 &&
                 ct.length < 40 &&
@@ -1004,7 +1060,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         const send = (node: HTMLElement): void => {
           const result = extractFromNode(node);
           if (!result) return;
-          // Dedup: skip exact same speaker+text
           if (result.speaker === lastSpeaker && result.text === lastText)
             return;
           lastSpeaker = result.speaker || lastSpeaker;
@@ -1016,23 +1071,39 @@ export class GoogleMeetBotService implements OnModuleDestroy {
           }
         };
 
-        // Debounce: coalesce rapid mutations within 150ms
-        let pending: HTMLElement | null = null;
-        let timer: ReturnType<typeof setTimeout> | null = null;
-        const flush = () => {
-          timer = null;
-          if (pending) {
-            send(pending);
-            pending = null;
-          }
-        };
+        // ── Multi-node debounce: coalesce rapid mutations per caption entry ──
+        // Uses a Map keyed by the direct-child node so concurrent speakers
+        // don't overwrite each other.
+        const pendingNodes = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
+        const DEBOUNCE_MS = 150;
+
         const enqueue = (node: HTMLElement) => {
-          pending = node;
-          if (!timer) timer = setTimeout(flush, 150);
+          // Find the direct child of captionsRegion (the caption entry container)
+          let entry: HTMLElement | null = node;
+          while (entry && entry.parentElement !== captionsRegion) {
+            entry = entry.parentElement;
+          }
+          if (!entry) {
+            // Fallback: use the node itself if we can't find the entry container
+            entry = node;
+          }
+
+          // Clear any existing debounce timer for this entry
+          const existing = pendingNodes.get(entry);
+          if (existing) clearTimeout(existing);
+
+          const target = entry; // capture for closure
+          pendingNodes.set(
+            target,
+            setTimeout(() => {
+              pendingNodes.delete(target);
+              send(target);
+            }, DEBOUNCE_MS),
+          );
         };
 
         // Observe ONLY the captions region (not document.body)
-        new MutationObserver((mutations) => {
+        const observer = new MutationObserver((mutations) => {
           for (const m of mutations) {
             for (const n of Array.from(m.addedNodes)) {
               if (n instanceof HTMLElement) enqueue(n);
@@ -1041,33 +1112,52 @@ export class GoogleMeetBotService implements OnModuleDestroy {
               m.type === 'characterData' &&
               m.target?.parentElement instanceof HTMLElement
             ) {
-              // Walk up to find the caption entry (direct child of region)
-              let el: HTMLElement | null = m.target
-                .parentElement as HTMLElement;
-              while (el && el.parentElement !== captionsRegion) {
-                el = el.parentElement;
-              }
-              if (el) enqueue(el);
+              enqueue(m.target.parentElement as HTMLElement);
             }
           }
-        }).observe(captionsRegion, {
+        });
+
+        observer.observe(captionsRegion, {
           childList: true,
           characterData: true,
           subtree: true,
         });
 
+        // Store reference so we can disconnect and health-check
+        (window as any).__meetbot_observer = observer;
+        (window as any).__meetbot_observerAttached = true;
+
+        // Self-healing: if the captionsRegion is detached from the DOM,
+        // mark as unhealthy so the Node.js health-check will re-attach.
+        const parentObserver = new MutationObserver(() => {
+          if (!captionsRegion.isConnected) {
+            console.warn('[MeetBot] Captions region detached from DOM');
+            (window as any).__meetbot_observerAttached = false;
+            observer.disconnect();
+            parentObserver.disconnect();
+          }
+        });
+        // Observe the parent to detect removal of the captions region
+        if (captionsRegion.parentElement) {
+          parentObserver.observe(captionsRegion.parentElement, { childList: true });
+        }
+
         console.log('[MeetBot] Caption observer attached to region');
+        return true;
       });
 
-      this.logger.log('Caption MutationObserver injected into Captions region');
+      if (attached) {
+        this.logger.log(
+          `Caption MutationObserver injected (generation ${generation}) for ${meetingKey}`,
+        );
+      } else {
+        this.logger.warn(
+          `Failed to attach caption observer (generation ${generation}) for ${meetingKey} — captions region not found`,
+        );
+      }
     } catch (err: any) {
       this.logger.warn(`Failed to inject observer: ${err.message}`);
     }
-
-    // Step 5: No timer-based finalization. The remaining caption is stored
-    // on bot.currentText and will be retrieved by bots.service.ts via
-    // getRemainingCaption() BEFORE saving the transcript buffer.
-    this.logger.log('Caption scraping active — segments will be saved when meeting ends');
   }
 
   // ---------------------------------------------------------------------------
@@ -1238,6 +1328,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     if (bot.flushInterval) clearInterval(bot.flushInterval);
     if (bot.endMonitorInterval) clearInterval(bot.endMonitorInterval);
     if (bot.participantMonitorInterval) clearInterval(bot.participantMonitorInterval);
+    if (bot.captionHealthInterval) clearInterval(bot.captionHealthInterval);
     if (bot.hardTimeoutTimer) clearTimeout(bot.hardTimeoutTimer);
 
     // Try to leave the meeting gracefully

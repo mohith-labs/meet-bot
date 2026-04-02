@@ -41,7 +41,7 @@ COPY . .
 RUN npm run build
 
 # Ensure the data directory exists for SQLite + auth.json
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/.data
 
 EXPOSE 3001
 

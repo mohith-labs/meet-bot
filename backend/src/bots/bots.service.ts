@@ -254,22 +254,48 @@ export class BotsService {
     meetingKey: string,
     caption: CaptionEvent,
   ): Promise<void> {
-    // Only accumulate final captions
-    if (!caption.isFinal) return;
+    const meetingStart = this.meetingStartTimes.get(meetingId);
+    const now = caption.timestamp || new Date();
+    const startTimeSec = meetingStart
+      ? (now.getTime() - meetingStart.getTime()) / 1000
+      : 0;
 
-    if (!this.transcriptBuffers.has(meetingId)) {
-      this.transcriptBuffers.set(meetingId, []);
+    if (caption.isFinal) {
+      // Buffer for DB save at meeting end
+      if (!this.transcriptBuffers.has(meetingId)) {
+        this.transcriptBuffers.set(meetingId, []);
+      }
+
+      this.transcriptBuffers.get(meetingId)!.push({
+        speaker: caption.speaker || 'Unknown',
+        text: caption.text,
+        timestamp: now,
+      });
+
+      this.logger.log(
+        `Caption buffered for ${meetingId}: [${caption.speaker}] "${caption.text}"`,
+      );
+
+      // Broadcast final segment to live WebSocket subscribers
+      const segmentId = uuidv4();
+      const finalPayload = {
+        id: segmentId,
+        text: caption.text,
+        speaker: caption.speaker || 'Unknown',
+        language: 'en',
+        startTime: startTimeSec,
+        endTime: startTimeSec + 3,
+        absoluteStartTime: now.getTime(),
+        isFinal: true as const,
+      };
+
+      try {
+        this.transcriptGateway.broadcastTranscriptFinal(meetingId, finalPayload);
+        this.transcriptGateway.broadcastTranscriptFinal(meetingKey, finalPayload);
+      } catch (error) {
+        this.logger.warn(`Failed to broadcast final transcript: ${error.message}`);
+      }
     }
-
-    this.transcriptBuffers.get(meetingId)!.push({
-      speaker: caption.speaker || 'Unknown',
-      text: caption.text,
-      timestamp: caption.timestamp,
-    });
-
-    this.logger.log(
-      `Caption buffered for ${meetingId}: [${caption.speaker}] "${caption.text}"`,
-    );
   }
 
   // ---------------------------------------------------------------------------

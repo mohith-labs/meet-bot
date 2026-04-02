@@ -138,7 +138,7 @@ PORT=3001
 JWT_SECRET=your-super-secret-key-change-in-production
 
 # Database
-DATABASE_URL=./database.sqlite
+DB_PATH=.data/database.sqlite
 
 # CORS
 FRONTEND_URL=http://localhost:3000
@@ -166,7 +166,7 @@ BOT_NAME=MeetBot
 |---|---|---|
 | `PORT` | Yes | Port the backend server listens on |
 | `JWT_SECRET` | Yes | Secret used to sign and verify JWT tokens. **Must** be changed in production. |
-| `DATABASE_URL` | Yes | File path for the SQLite database |
+| `DB_PATH` | Yes | File path for the SQLite database |
 | `FRONTEND_URL` | Yes | Allowed origin for CORS |
 | `ADMIN_EMAIL` | Yes | Email for the seeded admin account |
 | `ADMIN_PASSWORD` | Yes | Password for the seeded admin account |

@@ -6,7 +6,7 @@ services:
     environment:
       - PORT=${PORT}
       - JWT_SECRET=${JWT_SECRET}
-      - DATABASE_URL=${DATABASE_URL}
+      - DB_PATH=${DB_PATH}
       - FRONTEND_URL=${FRONTEND_URL}
       - BOT_NAME=${BOT_NAME}
       - GOOGLE_ACCOUNT_EMAIL=${GOOGLE_ACCOUNT_EMAIL}
