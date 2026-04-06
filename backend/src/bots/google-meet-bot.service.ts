@@ -38,6 +38,12 @@ interface ActiveBot {
   segmentTimestamp: Date;
   /** Tracks how many times the observer has been (re-)attached */
   observerGeneration: number;
+  /** Timestamp of the last caption received — used for staleness detection */
+  lastCaptionTime: number;
+  /** Whether the exposeFunction bridge has been registered on the page */
+  bridgeExposed: boolean;
+  /** Count of consecutive health-check recoveries (to avoid infinite re-enable loops) */
+  recoveryCount: number;
 }
 
 @Injectable()
@@ -47,8 +53,8 @@ export class GoogleMeetBotService implements OnModuleDestroy {
   /** Map of meetingKey -> active bot state */
   private activeBots = new Map<string, ActiveBot>();
 
-  /** Hard timeout for meetings: 100 minutes */
-  private readonly HARD_TIMEOUT_MS = 100 * 60 * 1000;
+  /** Hard timeout for meetings: 4 hours (previously 100 min, too short for long meetings) */
+  private readonly HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 
   constructor(private configService: ConfigService) {}
 
@@ -125,6 +131,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         currentText: '',
         segmentTimestamp: new Date(),
         observerGeneration: 0,
+        lastCaptionTime: 0,
+        bridgeExposed: false,
+        recoveryCount: 0,
       };
       this.activeBots.set(meetingKey, bot);
 
@@ -825,6 +834,159 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     ];
 
     // Step 2: Expose the bridge function BEFORE injecting the observer
+    await this.exposeCaptionBridge(page, meetingKey, emitter);
+
+    // Step 3: Inject MutationObserver (will be called on each health-check too)
+    await this.injectCaptionObserver(page, meetingKey);
+
+    // Step 4: Periodic finalization — force-finalize segments that have been
+    // accumulating for too long from a single speaker. This prevents data loss
+    // if the captions region is recreated and the old text is never reset.
+    const finalizeIntervalMs = this.CAPTION_FINALIZE_INTERVAL_SEC * 1000;
+    bot.flushInterval = setInterval(() => {
+      if (!bot.isRunning || !bot.currentText) return;
+      const age = Date.now() - bot.segmentTimestamp.getTime();
+      if (age >= finalizeIntervalMs) {
+        emitter.emit('caption', {
+          speaker: bot.currentSpeaker || 'Unknown',
+          text: bot.currentText,
+          timestamp: bot.segmentTimestamp,
+          isFinal: true,
+        } as CaptionEvent);
+        this.logger.debug(
+          `[Final/Periodic] [${bot.currentSpeaker}] "${bot.currentText}"`,
+        );
+        // Reset — the next incoming caption will start a fresh segment
+        bot.currentSpeaker = '';
+        bot.currentText = '';
+        bot.segmentTimestamp = new Date();
+      }
+    }, 10_000); // check every 10s
+
+    // Step 5: Caption health-check — comprehensive monitoring for long meetings.
+    // Checks: observer attachment, bridge function, caption staleness, captions enabled.
+    // Google Meet can recreate the captions region during long meetings, turn off
+    // captions, or rebuild the page context.
+    const STALENESS_THRESHOLD_MS = 2 * 60 * 1000; // 2 min without captions = stale
+    const MAX_RECOVERY_ATTEMPTS = 10; // prevent infinite re-enable loops
+
+    bot.captionHealthInterval = setInterval(async () => {
+      if (!bot.isRunning) return;
+      try {
+        // Check 1: Is the observer still attached?
+        const isObserverHealthy = await page.evaluate(() => {
+          return !!(window as any).__meetbot_observerAttached;
+        });
+
+        // Check 2: Is the bridge function still available?
+        const isBridgeHealthy = await page.evaluate(() => {
+          return typeof (window as any).__meetbot_onCaption === 'function';
+        });
+
+        // Check 3: Are we receiving captions? (staleness detection)
+        const timeSinceLastCaption = bot.lastCaptionTime > 0
+          ? Date.now() - bot.lastCaptionTime
+          : 0;
+        const isStale = bot.lastCaptionTime > 0 && timeSinceLastCaption > STALENESS_THRESHOLD_MS;
+
+        if (!isObserverHealthy || !isBridgeHealthy || isStale) {
+          const reasons: string[] = [];
+          if (!isObserverHealthy) reasons.push('observer detached');
+          if (!isBridgeHealthy) reasons.push('bridge function lost');
+          if (isStale) reasons.push(`stale (no captions for ${Math.round(timeSinceLastCaption / 1000)}s)`);
+
+          this.logger.warn(
+            `Caption health check failed for ${meetingKey}: ${reasons.join(', ')}. ` +
+            `Recovery attempt ${bot.recoveryCount + 1}/${MAX_RECOVERY_ATTEMPTS}`,
+          );
+
+          if (bot.recoveryCount >= MAX_RECOVERY_ATTEMPTS) {
+            this.logger.error(
+              `Max recovery attempts reached for ${meetingKey}. Captions may not work.`,
+            );
+            return;
+          }
+
+          bot.recoveryCount++;
+
+          // Recovery step 1: Re-expose bridge if lost
+          if (!isBridgeHealthy) {
+            bot.bridgeExposed = false;
+            await this.exposeCaptionBridge(page, meetingKey, emitter);
+          }
+
+          // Recovery step 2: Re-enable captions (Google Meet may have turned them off)
+          if (isStale) {
+            this.logger.log(`Re-enabling captions for ${meetingKey}...`);
+            await this.enableCaptions(page);
+          }
+
+          // Recovery step 3: Re-inject observer
+          await this.injectCaptionObserver(page, meetingKey);
+        } else {
+          // Reset recovery counter on healthy check
+          if (bot.recoveryCount > 0) {
+            this.logger.log(
+              `Caption health restored for ${meetingKey} after ${bot.recoveryCount} recovery attempts`,
+            );
+            bot.recoveryCount = 0;
+          }
+        }
+      } catch {
+        // Page may be closed — ignore
+      }
+    }, 10_000); // check every 10s
+
+    this.logger.log('Caption scraping active with enhanced health monitoring');
+  }
+
+  /**
+   * Expose (or re-expose) the __meetbot_onCaption bridge function.
+   * This is called once initially and can be re-called if the page context
+   * changes (e.g. Google Meet internal SPA navigation).
+   */
+  private async exposeCaptionBridge(
+    page: Page,
+    meetingKey: string,
+    emitter: EventEmitter,
+  ): Promise<boolean> {
+    const bot = this.activeBots.get(meetingKey);
+    if (!bot) return false;
+
+    // If already exposed, verify it's still working
+    if (bot.bridgeExposed) {
+      try {
+        const bridgeOk = await page.evaluate(() => {
+          return typeof (window as any).__meetbot_onCaption === 'function';
+        });
+        if (bridgeOk) return true;
+        this.logger.warn(`Bridge function lost for ${meetingKey} — re-exposing...`);
+      } catch {
+        // Page may have navigated — need to re-expose
+      }
+    }
+
+    // System phrases to filter out (Google Meet accessibility announcements)
+    const SYSTEM_PHRASES = [
+      'you have joined',
+      'joined the call',
+      'other person',
+      'people in the call',
+      'camera is turned',
+      'microphone is turned',
+      'hand is lowered',
+      'hand is raised',
+      'is presenting',
+      'left the meeting',
+      'return to home',
+      'leave call',
+      'feedback',
+      'audio and video',
+      'learn more',
+      'recording',
+      'transcript',
+    ];
+
     try {
       await page.exposeFunction(
         '__meetbot_onCaption',
@@ -838,6 +1000,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
           // Filter system messages
           const lower = cleanText.toLowerCase();
           if (SYSTEM_PHRASES.some((p) => lower.includes(p))) return;
+
+          // Track last caption time for staleness detection
+          bot.lastCaptionTime = Date.now();
 
           // Exact duplicate — skip
           if (cleanText === bot.currentText && cleanSpeaker === bot.currentSpeaker) return;
@@ -901,59 +1066,18 @@ export class GoogleMeetBotService implements OnModuleDestroy {
           bot.currentText = cleanText;
         },
       );
+      bot.bridgeExposed = true;
+      this.logger.log(`Bridge function exposed for ${meetingKey}`);
+      return true;
     } catch (err: any) {
+      // exposeFunction throws if the function is already registered
+      if (err.message?.includes('already been registered')) {
+        bot.bridgeExposed = true;
+        return true;
+      }
       this.logger.error(`Failed to expose __meetbot_onCaption: ${err.message}`);
-      return;
+      return false;
     }
-
-    // Step 3: Inject MutationObserver (will be called on each health-check too)
-    await this.injectCaptionObserver(page, meetingKey);
-
-    // Step 4: Periodic finalization — force-finalize segments that have been
-    // accumulating for too long from a single speaker. This prevents data loss
-    // if the captions region is recreated and the old text is never reset.
-    const finalizeIntervalMs = this.CAPTION_FINALIZE_INTERVAL_SEC * 1000;
-    bot.flushInterval = setInterval(() => {
-      if (!bot.isRunning || !bot.currentText) return;
-      const age = Date.now() - bot.segmentTimestamp.getTime();
-      if (age >= finalizeIntervalMs) {
-        emitter.emit('caption', {
-          speaker: bot.currentSpeaker || 'Unknown',
-          text: bot.currentText,
-          timestamp: bot.segmentTimestamp,
-          isFinal: true,
-        } as CaptionEvent);
-        this.logger.debug(
-          `[Final/Periodic] [${bot.currentSpeaker}] "${bot.currentText}"`,
-        );
-        // Reset — the next incoming caption will start a fresh segment
-        bot.currentSpeaker = '';
-        bot.currentText = '';
-        bot.segmentTimestamp = new Date();
-      }
-    }, 10_000); // check every 10s
-
-    // Step 5: Caption health-check — periodically verify the observed Captions
-    // region is still in the live DOM. Google Meet can recreate it when
-    // participants join/leave or after prolonged use.
-    bot.captionHealthInterval = setInterval(async () => {
-      if (!bot.isRunning) return;
-      try {
-        const isHealthy = await page.evaluate(() => {
-          return !!(window as any).__meetbot_observerAttached;
-        });
-        if (!isHealthy) {
-          this.logger.warn(
-            `Caption observer appears detached for ${meetingKey} — re-attaching...`,
-          );
-          await this.injectCaptionObserver(page, meetingKey);
-        }
-      } catch {
-        // Page may be closed — ignore
-      }
-    }, 10_000); // check every 10s
-
-    this.logger.log('Caption scraping active with health monitoring');
   }
 
   /**

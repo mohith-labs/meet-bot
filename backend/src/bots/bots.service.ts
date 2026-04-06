@@ -35,9 +35,15 @@ export class BotsService {
 
   /**
    * Accumulates final caption entries in memory per meeting.
-   * Flushed to the database when the meeting ends or the bot is stopped.
+   * Periodically flushed to the database and also on meeting end.
    */
   private readonly transcriptBuffers = new Map<string, Array<{ speaker: string; text: string; timestamp: Date }>>();
+
+  /** Periodic flush interval per meeting (saves transcripts every 30s to prevent data loss) */
+  private readonly periodicFlushIntervals = new Map<string, NodeJS.Timeout>();
+
+  /** How often to flush buffered transcripts to the DB (ms) */
+  private readonly PERIODIC_FLUSH_INTERVAL_MS = 30_000;
 
   constructor(
     @InjectRepository(Meeting)
@@ -202,6 +208,9 @@ export class BotsService {
         startTime: now,
       });
 
+      // Start periodic transcript flush to prevent data loss during long meetings
+      this.startPeriodicFlush(meetingId);
+
       // Dispatch meeting.started webhook
       const meeting = await this.meetingsRepository.findOne({ where: { id: meetingId } });
       if (meeting) {
@@ -307,10 +316,13 @@ export class BotsService {
     meetingKey: string,
   ): Promise<void> {
     try {
+      // Stop periodic flush — we're about to do a final save
+      this.stopPeriodicFlush(meetingId);
+
       // Flush any remaining caption from the bot BEFORE saving
       this.flushRemainingCaption(meetingId);
 
-      // Save all accumulated transcript segments
+      // Save all accumulated transcript segments (final flush — deletes buffer)
       await this.saveBufferedTranscripts(meetingId);
 
       // Dispatch meeting.ended webhook with transcript data
@@ -391,11 +403,14 @@ export class BotsService {
     await this.meetingsRepository.save(meeting);
     this.broadcastStatus(meeting.id, meetingKey, MeetingStatus.STOPPING);
 
+    // Stop periodic flush — we're about to do a final save
+    this.stopPeriodicFlush(meeting.id);
+
     // Flush remaining caption BEFORE stopping the browser (stopBot deletes
     // the bot from the activeBots map, making getRemainingCaption return null)
     this.flushRemainingCaption(meeting.id);
 
-    // Save all accumulated transcript segments
+    // Save all accumulated transcript segments (final flush)
     await this.saveBufferedTranscripts(meeting.id);
 
     // Dispatch meeting.ended webhook with transcript data
@@ -542,6 +557,43 @@ export class BotsService {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Periodic transcript flush (prevents data loss during long meetings)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start a periodic timer that flushes buffered transcripts to the DB.
+   * This protects against data loss if the bot crashes or is killed during
+   * a long meeting — previously ALL captions were kept only in memory.
+   */
+  private startPeriodicFlush(meetingId: string): void {
+    // Clear any existing interval for this meeting
+    this.stopPeriodicFlush(meetingId);
+
+    const interval = setInterval(async () => {
+      try {
+        await this.saveBufferedTranscripts(meetingId, true /* incremental */);
+      } catch (error) {
+        this.logger.error(
+          `Periodic flush failed for ${meetingId}: ${error.message}`,
+        );
+      }
+    }, this.PERIODIC_FLUSH_INTERVAL_MS);
+
+    this.periodicFlushIntervals.set(meetingId, interval);
+    this.logger.log(
+      `Started periodic transcript flush for ${meetingId} (every ${this.PERIODIC_FLUSH_INTERVAL_MS / 1000}s)`,
+    );
+  }
+
+  private stopPeriodicFlush(meetingId: string): void {
+    const interval = this.periodicFlushIntervals.get(meetingId);
+    if (interval) {
+      clearInterval(interval);
+      this.periodicFlushIntervals.delete(meetingId);
+    }
+  }
+
   /**
    * Pull any remaining unfinalised caption from the bot and add it to the buffer.
    * Must be called synchronously BEFORE saveBufferedTranscripts.
@@ -563,24 +615,41 @@ export class BotsService {
     }
   }
 
-  private async saveBufferedTranscripts(meetingId: string): Promise<void> {
+  /**
+   * Save buffered transcripts to the database.
+   *
+   * @param meetingId  The meeting to flush
+   * @param incremental  If true, drain the buffer but keep the Map entry so new
+   *                     captions continue to accumulate. If false (default),
+   *                     delete the buffer entirely (final flush at meeting end).
+   */
+  private async saveBufferedTranscripts(
+    meetingId: string,
+    incremental = false,
+  ): Promise<void> {
     const buffer = this.transcriptBuffers.get(meetingId);
     if (!buffer || buffer.length === 0) {
-      this.logger.log(`No transcript segments to save for meeting ${meetingId}`);
-      this.transcriptBuffers.delete(meetingId);
+      if (!incremental) {
+        this.transcriptBuffers.delete(meetingId);
+        this.logger.log(`No transcript segments to save for meeting ${meetingId}`);
+      }
       return;
     }
+
+    // Snapshot the current entries and drain the buffer so new captions
+    // that arrive while we're writing don't get duplicated.
+    const entries = buffer.splice(0, buffer.length);
 
     const meetingStart = this.meetingStartTimes.get(meetingId);
 
     try {
-      const segments = buffer.map((entry, index) => {
+      const segments = entries.map((entry, index) => {
         let startTime = 0;
         let endTime = 0;
         if (meetingStart) {
           startTime = (entry.timestamp.getTime() - meetingStart.getTime()) / 1000;
           // Estimate end time as start of next segment, or +3s for last segment
-          const nextEntry = buffer[index + 1];
+          const nextEntry = entries[index + 1];
           endTime = nextEntry
             ? (nextEntry.timestamp.getTime() - meetingStart.getTime()) / 1000
             : startTime + 3;
@@ -601,15 +670,25 @@ export class BotsService {
 
       await this.transcriptSegmentsRepository.save(segments);
       this.logger.log(
-        `Saved ${segments.length} transcript segments for meeting ${meetingId}`,
+        `Saved ${segments.length} transcript segments for meeting ${meetingId}` +
+          (incremental ? ' (periodic flush)' : ' (final flush)'),
       );
     } catch (error) {
       this.logger.error(
         `Failed to save transcript buffer for ${meetingId}: ${error.message}`,
       );
+      // On failure, put the entries back so they aren't lost
+      const currentBuffer = this.transcriptBuffers.get(meetingId);
+      if (currentBuffer) {
+        currentBuffer.unshift(...entries);
+      } else {
+        this.transcriptBuffers.set(meetingId, entries);
+      }
     }
 
-    this.transcriptBuffers.delete(meetingId);
+    if (!incremental) {
+      this.transcriptBuffers.delete(meetingId);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -625,7 +704,8 @@ export class BotsService {
       const update: Partial<Meeting> = { status };
       if (status === MeetingStatus.COMPLETED || status === MeetingStatus.FAILED) {
         update.endTime = new Date();
-        // Try to save any accumulated transcripts before cleanup
+        // Stop periodic flush and save any accumulated transcripts before cleanup
+        this.stopPeriodicFlush(meetingId);
         this.flushRemainingCaption(meetingId);
         await this.saveBufferedTranscripts(meetingId);
         this.meetingStartTimes.delete(meetingId);
