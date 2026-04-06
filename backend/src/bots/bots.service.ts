@@ -22,6 +22,7 @@ import { GoogleMeetBotService, CaptionEvent } from './google-meet-bot.service';
 import { TranscriptGateway } from '../websocket/transcript.gateway';
 import { WebhookDispatcherService } from '../webhooks/webhook-dispatcher.service';
 import { UsersService } from '../users/users.service';
+import { BotAuthService } from '../settings/bot-auth.service';
 
 @Injectable()
 export class BotsService {
@@ -56,6 +57,7 @@ export class BotsService {
     private readonly configService: ConfigService,
     private readonly webhookDispatcher: WebhookDispatcherService,
     private readonly usersService: UsersService,
+    private readonly botAuthService: BotAuthService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -146,12 +148,16 @@ export class BotsService {
       ? (user?.botAutoExitMinutes || 5)
       : 0;
 
+    // Resolve per-user auth file path
+    const authStatePath = this.botAuthService.resolveAuthPathForUser(userId);
+
     try {
       emitter = await this.googleMeetBotService.joinMeeting({
         meetingUrl,
         botName,
         meetingKey: meetingId, // use DB ID as the unique key inside GoogleMeetBotService
         autoExitMinutes,
+        authStatePath,
       });
     } catch (error) {
       this.logger.error(

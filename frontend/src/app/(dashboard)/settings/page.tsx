@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, type FormEvent } from "react";
+import { useState, useEffect, useCallback, useRef, type FormEvent, type ChangeEvent } from "react";
 import {
   Settings,
   Bell,
@@ -24,6 +24,13 @@ import {
   ToggleLeft,
   ToggleRight,
   Crown,
+  Upload,
+  KeyRound,
+  LogIn,
+  FileJson,
+  CheckCircle2,
+  XCircle,
+  Globe,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -40,6 +47,7 @@ import {
   type UserSettings,
   type AdminUser,
   type AdminAppSettings,
+  type BotAuthStatus,
 } from "@/lib/api";
 import toast from "react-hot-toast";
 
@@ -100,6 +108,17 @@ export default function SettingsPage() {
   const [isSavingWebhook, setIsSavingWebhook] = useState(false);
   const [testingWebhookId, setTestingWebhookId] = useState<string | null>(null);
   const [deletingWebhookId, setDeletingWebhookId] = useState<string | null>(null);
+
+  // ── Bot auth state ───────────────────────────────────────────────────────
+  const [botAuthStatus, setBotAuthStatus] = useState<BotAuthStatus | null>(null);
+  const [isLoadingBotAuth, setIsLoadingBotAuth] = useState(true);
+  const [isUploadingAuth, setIsUploadingAuth] = useState(false);
+  const [isDeletingAuth, setIsDeletingAuth] = useState(false);
+  const [oauthConfigured, setOauthConfigured] = useState(false);
+  const [isLoadingOAuthUrl, setIsLoadingOAuthUrl] = useState(false);
+  const [showAuthPasteModal, setShowAuthPasteModal] = useState(false);
+  const [authPasteContent, setAuthPasteContent] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // ── Danger zone state ───────────────────────────────────────────────────
   const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -164,14 +183,53 @@ export default function SettingsPage() {
     }
   }, [isAdmin]);
 
+  // ── Load bot auth status ────────────────────────────────────────────────
+  const loadBotAuthStatus = useCallback(async () => {
+    setIsLoadingBotAuth(true);
+    try {
+      const [authStatus, oauthConfig] = await Promise.all([
+        api.getBotAuthStatus(),
+        api.getOAuthConfig().catch(() => ({ isConfigured: false })),
+      ]);
+      setBotAuthStatus(authStatus);
+      setOauthConfigured(oauthConfig.isConfigured);
+    } catch {
+      setBotAuthStatus(null);
+    } finally {
+      setIsLoadingBotAuth(false);
+    }
+  }, []);
+
   useEffect(() => {
     loadSettings();
     loadWebhooks();
+    loadBotAuthStatus();
     if (isAdmin) {
       loadAdminUsers();
       loadAdminSettings();
     }
-  }, [loadSettings, loadWebhooks, isAdmin, loadAdminUsers, loadAdminSettings]);
+  }, [loadSettings, loadWebhooks, loadBotAuthStatus, isAdmin, loadAdminUsers, loadAdminSettings]);
+
+  // ── Handle OAuth callback (if returning from Google OAuth) ──────────────
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const state = params.get("state");
+    if (code) {
+      // Clear the URL params
+      window.history.replaceState({}, "", window.location.pathname);
+      // Handle the callback
+      api
+        .handleOAuthCallback(code, state || undefined)
+        .then((result) => {
+          toast.success(result.message);
+          setBotAuthStatus(result.status);
+        })
+        .catch((err: any) => {
+          toast.error(err.message || "OAuth authentication failed");
+        });
+    }
+  }, []);
 
   // ── Save bot settings ───────────────────────────────────────────────────
   const handleSaveSettings = async (e: FormEvent) => {
@@ -252,6 +310,69 @@ export default function SettingsPage() {
       toast.error(err.message || "Failed to update registration settings");
     } finally {
       setIsTogglingRegistration(false);
+    }
+  };
+
+  // ── Bot auth handlers ────────────────────────────────────────────────────
+  const handleAuthFileUpload = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsUploadingAuth(true);
+    try {
+      const result = await api.uploadBotAuth(file);
+      toast.success(result.message);
+      setBotAuthStatus(result.status);
+    } catch (err: any) {
+      toast.error(err.message || "Failed to upload auth file");
+    } finally {
+      setIsUploadingAuth(false);
+      // Reset the file input so the same file can be selected again
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const handleAuthPasteSubmit = async () => {
+    if (!authPasteContent.trim()) {
+      toast.error("Please paste the auth.json content");
+      return;
+    }
+    setIsUploadingAuth(true);
+    try {
+      const result = await api.uploadBotAuthJson(authPasteContent.trim());
+      toast.success(result.message);
+      setBotAuthStatus(result.status);
+      setShowAuthPasteModal(false);
+      setAuthPasteContent("");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to upload auth content");
+    } finally {
+      setIsUploadingAuth(false);
+    }
+  };
+
+  const handleDeleteAuth = async () => {
+    setIsDeletingAuth(true);
+    try {
+      const result = await api.deleteBotAuth();
+      toast.success(result.message);
+      setBotAuthStatus(result.status);
+    } catch (err: any) {
+      toast.error(err.message || "Failed to delete auth");
+    } finally {
+      setIsDeletingAuth(false);
+    }
+  };
+
+  const handleGoogleOAuth = async () => {
+    setIsLoadingOAuthUrl(true);
+    try {
+      const { url } = await api.getOAuthUrl();
+      // Redirect to Google OAuth consent screen
+      window.location.href = url;
+    } catch (err: any) {
+      toast.error(err.message || "Failed to start Google OAuth");
+      setIsLoadingOAuthUrl(false);
     }
   };
 
@@ -819,6 +940,243 @@ export default function SettingsPage() {
           </form>
         )}
       </Card>
+
+      {/* ── Bot Authentication Section ─────────────────────────────────── */}
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>
+              <span className="inline-flex items-center gap-2">
+                <KeyRound className="h-5 w-5 text-[#6c5ce7]" />
+                Bot Authentication
+              </span>
+            </CardTitle>
+            <CardDescription>
+              Configure the Google account the bot uses to join meetings
+            </CardDescription>
+          </div>
+        </CardHeader>
+
+        {isLoadingBotAuth ? (
+          <div className="flex items-center justify-center py-8">
+            <div className="h-6 w-6 border-2 border-[#6c5ce7] border-t-transparent rounded-full animate-spin" />
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {/* ── Auth Status ───────────────────────────────────────────── */}
+            <div
+              className={`flex items-center gap-3 p-4 rounded-lg border ${
+                botAuthStatus?.isConfigured
+                  ? "border-emerald-500/30 bg-emerald-500/5"
+                  : "border-amber-500/30 bg-amber-500/5"
+              }`}
+            >
+              {botAuthStatus?.isConfigured ? (
+                <CheckCircle2 className="h-5 w-5 text-emerald-400 flex-shrink-0" />
+              ) : (
+                <XCircle className="h-5 w-5 text-amber-400 flex-shrink-0" />
+              )}
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-[#e4e4f0]">
+                  {botAuthStatus?.isConfigured
+                    ? "Google account connected"
+                    : "No Google account configured"}
+                </p>
+                {botAuthStatus?.isConfigured ? (
+                  <div className="flex items-center gap-3 mt-1 flex-wrap">
+                    {botAuthStatus.email && (
+                      <span className="text-xs text-text-secondary inline-flex items-center gap-1">
+                        <Mail className="h-3 w-3" />
+                        {botAuthStatus.email}
+                      </span>
+                    )}
+                    <Badge
+                      variant={
+                        botAuthStatus.method === "oauth"
+                          ? "brand"
+                          : botAuthStatus.method === "upload"
+                            ? "info"
+                            : "neutral"
+                      }
+                    >
+                      {botAuthStatus.method === "oauth"
+                        ? "Google OAuth"
+                        : botAuthStatus.method === "upload"
+                          ? "Uploaded"
+                          : "Global Config"}
+                    </Badge>
+                    {botAuthStatus.lastUpdated && (
+                      <span className="text-xs text-text-muted">
+                        Updated: {formatRelativeTime(botAuthStatus.lastUpdated)}
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs text-text-secondary mt-0.5">
+                    The bot will join meetings as a guest. Connect a Google
+                    account for better access.
+                  </p>
+                )}
+              </div>
+              {botAuthStatus?.isConfigured &&
+                botAuthStatus.method !== "global" && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleDeleteAuth}
+                    isLoading={isDeletingAuth}
+                    className="text-error hover:text-error flex-shrink-0"
+                    title="Remove authentication"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                )}
+            </div>
+
+            {/* ── Auth Actions ──────────────────────────────────────────── */}
+            <div className="space-y-3">
+              {/* Google OAuth option */}
+              {oauthConfigured && (
+                <div className="p-4 rounded-lg border border-[#2a2a3e] bg-[#16162a]">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="flex items-center justify-center h-10 w-10 rounded-lg bg-[#6c5ce7]/10">
+                        <Globe className="h-5 w-5 text-[#6c5ce7]" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium text-[#e4e4f0]">
+                          Sign in with Google
+                        </p>
+                        <p className="text-xs text-text-secondary">
+                          Connect your Google account via OAuth for the bot to
+                          use
+                        </p>
+                      </div>
+                    </div>
+                    <Button
+                      size="sm"
+                      leftIcon={<LogIn className="h-4 w-4" />}
+                      onClick={handleGoogleOAuth}
+                      isLoading={isLoadingOAuthUrl}
+                    >
+                      Connect
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {/* Upload auth.json option */}
+              <div className="p-4 rounded-lg border border-[#2a2a3e] bg-[#16162a]">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center justify-center h-10 w-10 rounded-lg bg-[#6c5ce7]/10">
+                      <FileJson className="h-5 w-5 text-[#6c5ce7]" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-[#e4e4f0]">
+                        Upload auth.json
+                      </p>
+                      <p className="text-xs text-text-secondary">
+                        Upload a Playwright auth state file generated by{" "}
+                        <code className="px-1 py-0.5 rounded bg-bg-tertiary text-xs font-mono">
+                          npm run gen:auth
+                        </code>
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      leftIcon={<Upload className="h-4 w-4" />}
+                      onClick={() => fileInputRef.current?.click()}
+                      isLoading={isUploadingAuth}
+                    >
+                      Upload File
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setShowAuthPasteModal(true)}
+                      title="Paste JSON content"
+                    >
+                      Paste
+                    </Button>
+                  </div>
+                </div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  onChange={handleAuthFileUpload}
+                  className="hidden"
+                />
+              </div>
+
+              {/* Instructions */}
+              <div className="p-3 rounded-lg bg-[#16162a]/50 border border-[#2a2a3e]/50">
+                <p className="text-xs text-text-muted leading-relaxed">
+                  <span className="font-medium text-text-secondary">
+                    How to generate auth.json:
+                  </span>{" "}
+                  Run{" "}
+                  <code className="px-1 py-0.5 rounded bg-bg-tertiary text-xs font-mono">
+                    npm run gen:auth
+                  </code>{" "}
+                  in the backend directory. This opens a browser where you log
+                  into a Google account. The session is saved to{" "}
+                  <code className="px-1 py-0.5 rounded bg-bg-tertiary text-xs font-mono">
+                    auth.json
+                  </code>{" "}
+                  which you can then upload here. Use a secondary Google
+                  account, not your primary one.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {/* ── Paste Auth JSON Modal ───────────────────────────────────────── */}
+      <Modal
+        isOpen={showAuthPasteModal}
+        onClose={() => {
+          setShowAuthPasteModal(false);
+          setAuthPasteContent("");
+        }}
+        title="Paste auth.json Content"
+        description="Paste the contents of your auth.json file below"
+        size="lg"
+      >
+        <div className="space-y-4">
+          <textarea
+            value={authPasteContent}
+            onChange={(e) => setAuthPasteContent(e.target.value)}
+            placeholder='{"cookies": [...], "origins": [...]}'
+            rows={12}
+            className="w-full bg-bg-secondary border border-border rounded-lg px-4 py-3 text-sm text-text-primary font-mono placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-[#6c5ce7]/50 focus:border-[#6c5ce7] hover:border-border-hover resize-none"
+          />
+          <div className="flex gap-3 justify-end">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setShowAuthPasteModal(false);
+                setAuthPasteContent("");
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              leftIcon={<Upload className="h-4 w-4" />}
+              onClick={handleAuthPasteSubmit}
+              isLoading={isUploadingAuth}
+              disabled={!authPasteContent.trim()}
+            >
+              Upload
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       {/* ── Webhooks Section ────────────────────────────────────────────── */}
       <Card>

@@ -67,6 +67,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     botName: string;
     meetingKey: string;
     autoExitMinutes?: number; // 0 = disabled
+    authStatePath?: string | null; // per-user auth file path (overrides global)
   }): Promise<EventEmitter> {
     const { meetingUrl, botName, meetingKey } = options;
     const emitter = new EventEmitter();
@@ -79,8 +80,10 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     try {
       emitter.emit('status', 'joining');
 
-      // Resolve auth state path
-      const authPath = this.resolveAuthPath();
+      // Use per-user auth path if provided, otherwise fall back to global
+      const authPath = options.authStatePath !== undefined
+        ? options.authStatePath
+        : this.resolveAuthPath();
 
       // Launch Playwright Chromium with Google Meet-optimized flags
       const browser = await chromium.launch({

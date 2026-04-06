@@ -226,6 +226,39 @@ export interface UpdateSettingsData {
   botAutoExitMinutes?: number;
 }
 
+// Bot auth types
+export interface BotAuthStatus {
+  isConfigured: boolean;
+  method: "upload" | "oauth" | "global" | null;
+  lastUpdated: string | null;
+  email: string | null;
+}
+
+export interface BotAuthUploadResponse {
+  message: string;
+  status: BotAuthStatus;
+}
+
+export interface BotAuthDeleteResponse {
+  message: string;
+  status: BotAuthStatus;
+}
+
+export interface OAuthConfigResponse {
+  isConfigured: boolean;
+}
+
+export interface OAuthUrlResponse {
+  url: string;
+  state: string;
+}
+
+export interface OAuthCallbackResponse {
+  message: string;
+  email: string;
+  status: BotAuthStatus;
+}
+
 // ─── Admin types ────────────────────────────────────────────────────────────
 
 export interface AdminUser {
@@ -503,6 +536,81 @@ class ApiClient {
       method: "PATCH",
       body: JSON.stringify(data),
     });
+  }
+
+  // ── Bot Auth ───────────────────────────────────────────────────────────────
+
+  async getBotAuthStatus(): Promise<BotAuthStatus> {
+    return this.request<BotAuthStatus>("/settings/bot-auth/status");
+  }
+
+  async uploadBotAuth(file: File): Promise<BotAuthUploadResponse> {
+    const token = getToken();
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const headers: Record<string, string> = {};
+    if (token && token !== "undefined" && token !== "null") {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${this.baseUrl}/settings/bot-auth/upload`, {
+      method: "POST",
+      headers,
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({
+        message: "An error occurred",
+      }));
+      throw new Error(error.message || `HTTP ${response.status}`);
+    }
+
+    const json = await response.json();
+    return json.data ?? json;
+  }
+
+  async uploadBotAuthJson(
+    content: string,
+    email?: string
+  ): Promise<BotAuthUploadResponse> {
+    return this.request<BotAuthUploadResponse>(
+      "/settings/bot-auth/upload-json",
+      {
+        method: "POST",
+        body: JSON.stringify({ content, email }),
+      }
+    );
+  }
+
+  async deleteBotAuth(): Promise<BotAuthDeleteResponse> {
+    return this.request<BotAuthDeleteResponse>("/settings/bot-auth", {
+      method: "DELETE",
+    });
+  }
+
+  async getOAuthConfig(): Promise<OAuthConfigResponse> {
+    return this.request<OAuthConfigResponse>(
+      "/settings/bot-auth/oauth/config"
+    );
+  }
+
+  async getOAuthUrl(): Promise<OAuthUrlResponse> {
+    return this.request<OAuthUrlResponse>("/settings/bot-auth/oauth/url");
+  }
+
+  async handleOAuthCallback(
+    code: string,
+    state?: string
+  ): Promise<OAuthCallbackResponse> {
+    return this.request<OAuthCallbackResponse>(
+      "/settings/bot-auth/oauth/callback",
+      {
+        method: "POST",
+        body: JSON.stringify({ code, state }),
+      }
+    );
   }
 
   // ── Admin ──────────────────────────────────────────────────────────────────

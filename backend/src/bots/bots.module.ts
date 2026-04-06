@@ -9,6 +9,7 @@ import { AuthModule } from '../auth/auth.module';
 import { WebSocketModule } from '../websocket/websocket.module';
 import { WebhooksModule } from '../webhooks/webhooks.module';
 import { UsersModule } from '../users/users.module';
+import { SettingsModule } from '../settings/settings.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { UsersModule } from '../users/users.module';
     forwardRef(() => WebSocketModule), // forwardRef to avoid circular dependency
     WebhooksModule,
     UsersModule,
+    SettingsModule,
   ],
   providers: [BotsService, GoogleMeetBotService],
   controllers: [BotsController],
