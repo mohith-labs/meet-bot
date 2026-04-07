@@ -20,8 +20,7 @@ services:
       - REGISTRATION_ENABLED=${REGISTRATION_ENABLED}
       - STORAGE_PATH=${STORAGE_PATH:-.data/recordings}
     volumes:
-      - backend-data:/app/data
-      - backend-recordings:/app/.data/recordings
+      - backend-data:/app/.data
 
   frontend:
     build:
@@ -36,4 +35,3 @@ services:
 
 volumes:
   backend-data:
-  backend-recordings:
