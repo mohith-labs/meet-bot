@@ -1,8 +1,6 @@
 FROM node:20-slim
 
 # Install Chromium dependencies required by Playwright + ffmpeg for recording merge
-# + Xvfb for virtual display + PulseAudio for virtual audio output (needed for
-# headed Chrome audio recording in Docker).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libatk1.0-0 \
@@ -26,8 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     locales \
     ffmpeg \
-    xvfb \
-    pulseaudio \
   && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen \
   && locale-gen \
   && rm -rf /var/lib/apt/lists/*
@@ -48,11 +44,6 @@ RUN npm run build
 # Ensure the data directory exists for SQLite + auth.json
 RUN mkdir -p /app/data /app/.data
 
-# Create the entrypoint that starts Xvfb + PulseAudio before the app
-COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
-
 EXPOSE 3001
 
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["npm", "run", "start:prod"]

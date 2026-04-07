@@ -97,11 +97,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         ? options.authStatePath
         : this.resolveAuthPath();
 
-      // Launch Playwright Chromium in headed mode.
-      // Audio recording requires a real audio output pipeline — headless
-      // Chromium has NO audio sink, so AudioContext/MediaRecorder produce
-      // silence.  In Docker, Xvfb + PulseAudio provide virtual display
-      // and audio.
+      // Launch Playwright Chromium in headless mode.
       const browser = await chromium.launch({
         headless: true,
         args: [
