@@ -422,6 +422,12 @@ class ApiClient {
     return this.request<Meeting[]>("/meetings");
   }
 
+  async getMeetingById(id: string): Promise<Meeting> {
+    return this.request<Meeting>(
+      `/meetings/detail/${encodeURIComponent(id)}`
+    );
+  }
+
   async getMeeting(
     platform: string,
     nativeMeetingId: string
@@ -456,6 +462,14 @@ class ApiClient {
   }
 
   // ── Transcripts ─────────────────────────────────────────────────────────
+
+  async getTranscriptByMeetingId(
+    meetingId: string
+  ): Promise<TranscriptResponse> {
+    return this.request<TranscriptResponse>(
+      `/transcripts/meeting/${encodeURIComponent(meetingId)}`
+    );
+  }
 
   async getTranscript(
     platform: string,

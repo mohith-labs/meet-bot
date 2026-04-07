@@ -61,6 +61,50 @@ export class TranscriptsService {
     };
   }
 
+  async getTranscriptByMeetingId(userId: string, meetingId: string) {
+    const meeting = await this.meetingsRepository.findOne({
+      where: { id: meetingId, userId },
+    });
+
+    if (!meeting) {
+      throw new NotFoundException('Meeting not found');
+    }
+
+    const segments = await this.transcriptSegmentsRepository.find({
+      where: { meetingId: meeting.id },
+      order: { startTime: 'ASC', createdAt: 'ASC' },
+    });
+
+    return {
+      meeting: {
+        id: meeting.id,
+        platform: meeting.platform,
+        nativeMeetingId: meeting.nativeMeetingId,
+        constructedMeetingUrl: meeting.constructedMeetingUrl,
+        status: meeting.status,
+        startTime: meeting.startTime,
+        endTime: meeting.endTime,
+        data: meeting.data,
+      },
+      segments: segments.map((seg) => ({
+        id: seg.id,
+        text: seg.text,
+        speaker: seg.speaker,
+        language: seg.language,
+        startTime: seg.startTime,
+        endTime: seg.endTime,
+        absoluteStartTime: seg.absoluteStartTime,
+        absoluteEndTime: seg.absoluteEndTime,
+        completed: seg.completed,
+        createdAt: seg.createdAt,
+      })),
+      totalSegments: segments.length,
+      fullText: segments
+        .map((s) => `[${s.speaker || 'Unknown'}]: ${s.text}`)
+        .join('\n'),
+    };
+  }
+
   async createSegment(
     meetingId: string,
     data: {

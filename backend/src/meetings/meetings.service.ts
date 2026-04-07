@@ -83,6 +83,18 @@ export class MeetingsService {
     await this.meetingsRepository.remove(meeting);
   }
 
+  async findByIdForUser(userId: string, meetingId: string): Promise<Meeting> {
+    const meeting = await this.meetingsRepository.findOne({
+      where: { id: meetingId, userId },
+    });
+
+    if (!meeting) {
+      throw new NotFoundException('Meeting not found');
+    }
+
+    return meeting;
+  }
+
   async findById(meetingId: string): Promise<Meeting | null> {
     return this.meetingsRepository.findOne({
       where: { id: meetingId },

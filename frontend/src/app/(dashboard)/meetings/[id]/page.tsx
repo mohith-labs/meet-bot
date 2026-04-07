@@ -70,6 +70,7 @@ export default function MeetingDetailPage() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [transcriptRetryCount, setTranscriptRetryCount] = useState(0);
 
   const isLive =
     meeting?.status === "active" ||
@@ -78,33 +79,22 @@ export default function MeetingDetailPage() {
 
   // Live transcript feature removed — transcripts are saved after the call ends
 
-  // Load meeting by first fetching all meetings to find UUID -> platform/nativeMeetingId mapping
+  // Load meeting by UUID directly (no more fetching all meetings)
   useEffect(() => {
     async function loadMeeting() {
       try {
-        // Fetch all meetings and find the one matching the UUID
-        const allMeetings = await api.listMeetings();
-        const found = allMeetings.find((m) => m.id === meetingId);
-
-        if (!found) {
-          setIsLoading(false);
-          return;
-        }
-
+        const found = await api.getMeetingById(meetingId);
         setMeeting(found);
 
-        // Now fetch transcript using platform/nativeMeetingId
+        // Fetch transcript using meeting UUID
         try {
-          const transcriptData = await api.getTranscript(
-            found.platform,
-            found.nativeMeetingId
-          );
+          const transcriptData = await api.getTranscriptByMeetingId(meetingId);
           setSegments(transcriptData.segments);
         } catch {
           // Transcript may not exist yet — that's fine
         }
       } catch {
-        toast.error("Failed to load meeting");
+        // Meeting not found or fetch failed
       } finally {
         setIsLoading(false);
       }
@@ -113,15 +103,32 @@ export default function MeetingDetailPage() {
     loadMeeting();
   }, [meetingId]);
 
-  // Refresh transcript when meeting completes
+  // Retry polling for transcript availability after meeting completion
+  // 3s interval, up to 5 attempts
   useEffect(() => {
-    if (meeting?.status === 'completed' && segments.length === 0) {
-      // Re-fetch transcript after meeting completes
-      api.getTranscript(meeting.platform, meeting.nativeMeetingId)
-        .then((data) => setSegments(data.segments))
-        .catch(() => {});
+    if (
+      meeting?.status !== "completed" ||
+      segments.length > 0 ||
+      transcriptRetryCount >= 5
+    ) {
+      return;
     }
-  }, [meeting?.status, meeting?.platform, meeting?.nativeMeetingId, segments.length]);
+
+    const timer = setTimeout(async () => {
+      try {
+        const transcriptData = await api.getTranscriptByMeetingId(meetingId);
+        if (transcriptData.segments.length > 0) {
+          setSegments(transcriptData.segments);
+        } else {
+          setTranscriptRetryCount((c) => c + 1);
+        }
+      } catch {
+        setTranscriptRetryCount((c) => c + 1);
+      }
+    }, 3000);
+
+    return () => clearTimeout(timer);
+  }, [meeting?.status, meetingId, segments.length, transcriptRetryCount]);
 
   const handleStop = async () => {
     if (!meeting) return;

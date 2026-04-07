@@ -87,7 +87,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
       // Launch Playwright Chromium with Google Meet-optimized flags
       const browser = await chromium.launch({
-        headless: true,
+        headless: false,
         args: [
           '--no-sandbox',
           '--use-fake-ui-for-media-stream',

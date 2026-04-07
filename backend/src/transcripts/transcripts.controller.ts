@@ -20,6 +20,28 @@ import { MeetingPlatform } from '../entities/meeting.entity';
 export class TranscriptsController {
   constructor(private readonly transcriptsService: TranscriptsService) {}
 
+  @Get('meeting/:meetingId')
+  @ApiOperation({
+    summary: 'Get transcript by meeting UUID',
+    description:
+      'Returns the full transcript for a specific meeting identified by its UUID. This avoids ambiguity when the same room code is reused.',
+  })
+  @ApiParam({ name: 'meetingId', description: 'Meeting UUID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Returns transcript with meeting metadata and segments',
+  })
+  @ApiResponse({ status: 404, description: 'Meeting not found' })
+  async getTranscriptByMeetingId(
+    @CurrentUser() user: any,
+    @Param('meetingId') meetingId: string,
+  ) {
+    return this.transcriptsService.getTranscriptByMeetingId(
+      user.id,
+      meetingId,
+    );
+  }
+
   @Get(':platform/:nativeMeetingId')
   @ApiOperation({
     summary: 'Get transcript for a meeting',

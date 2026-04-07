@@ -51,6 +51,36 @@ export class MeetingsController {
     }));
   }
 
+  @Get('detail/:id')
+  @ApiOperation({
+    summary: 'Get meeting by UUID',
+    description:
+      'Returns meeting details for a specific meeting identified by its UUID. This avoids ambiguity when the same room code is reused across multiple meetings.',
+  })
+  @ApiParam({ name: 'id', description: 'Meeting UUID' })
+  @ApiResponse({ status: 200, description: 'Returns meeting details' })
+  @ApiResponse({ status: 404, description: 'Meeting not found' })
+  async getMeetingById(
+    @CurrentUser() user: any,
+    @Param('id') id: string,
+  ) {
+    const meeting = await this.meetingsService.findByIdForUser(user.id, id);
+
+    return {
+      id: meeting.id,
+      platform: meeting.platform,
+      nativeMeetingId: meeting.nativeMeetingId,
+      constructedMeetingUrl: meeting.constructedMeetingUrl,
+      status: meeting.status,
+      botContainerId: meeting.botContainerId,
+      startTime: meeting.startTime,
+      endTime: meeting.endTime,
+      data: meeting.data,
+      createdAt: meeting.createdAt,
+      updatedAt: meeting.updatedAt,
+    };
+  }
+
   @Get(':platform/:nativeMeetingId')
   @ApiOperation({
     summary: 'Get meeting details',
