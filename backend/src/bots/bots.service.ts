@@ -491,9 +491,26 @@ export class BotsService {
       );
     }
 
-    // Mark as completed
+    // Check for recording files saved by googleMeetBotService.stopBot()
+    const storagePath = resolveStoragePath(this.configService);
+    const recordingDir = path.join(storagePath, meeting.id);
+    const recordingUpdates: Record<string, string> = {};
+
+    const screenPath = path.join(recordingDir, 'screen.webm');
+    if (fs.existsSync(screenPath)) {
+      recordingUpdates.screenRecordingPath = screenPath;
+    }
+    const audioPath = path.join(recordingDir, 'audio.webm');
+    if (fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0) {
+      recordingUpdates.audioRecordingPath = audioPath;
+    }
+
+    // Mark as completed and save recording paths
     meeting.status = MeetingStatus.COMPLETED;
     meeting.endTime = new Date();
+    if (Object.keys(recordingUpdates).length > 0) {
+      meeting.data = { ...meeting.data, ...recordingUpdates };
+    }
     await this.meetingsRepository.save(meeting);
 
     this.meetingStartTimes.delete(meeting.id);
