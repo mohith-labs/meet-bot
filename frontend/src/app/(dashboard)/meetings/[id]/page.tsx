@@ -75,6 +75,7 @@ export default function MeetingDetailPage() {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [transcriptRetryCount, setTranscriptRetryCount] = useState(0);
+  const [meetingRetryCount, setMeetingRetryCount] = useState(0);
 
   const isLive =
     meeting?.status === "active" ||
@@ -107,6 +108,45 @@ export default function MeetingDetailPage() {
     loadMeeting();
   }, [meetingId]);
 
+  // Poll for meeting status changes while the meeting is live.
+  // When the bot auto-exits (or meeting ends naturally), the backend updates
+  // the status to "completed" — but the frontend has no WebSocket notification,
+  // so we poll every 5s. Once we detect the transition, we update local state
+  // which triggers the existing transcript/recording retry polling effects.
+  useEffect(() => {
+    if (!isLive) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const updated = await api.getMeetingById(meetingId);
+        const newIsLive =
+          updated.status === "active" ||
+          updated.status === "joining" ||
+          updated.status === "awaiting_admission";
+
+        if (!newIsLive) {
+          // Meeting is no longer live — update state to trigger retry polling
+          setMeeting(updated);
+
+          // Also eagerly fetch transcripts now
+          try {
+            const transcriptData =
+              await api.getTranscriptByMeetingId(meetingId);
+            if (transcriptData.segments.length > 0) {
+              setSegments(transcriptData.segments);
+            }
+          } catch {
+            // Transcript may not be ready yet — retry polling will handle it
+          }
+        }
+      } catch {
+        // Network error — ignore, will retry on next interval
+      }
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [isLive, meetingId]);
+
   // Retry polling for transcript availability after meeting completion
   // 3s interval, up to 5 attempts
   useEffect(() => {
@@ -133,6 +173,49 @@ export default function MeetingDetailPage() {
 
     return () => clearTimeout(timer);
   }, [meeting?.status, meetingId, segments.length, transcriptRetryCount]);
+
+  // Retry polling for recording paths after meeting completion.
+  // Recordings are saved by the bot slightly after the meeting status changes
+  // to completed, so the meeting data may not have recording paths yet.
+  const hasRecordings =
+    !!meeting?.data?.screenRecordingPath || !!meeting?.data?.audioRecordingPath;
+  const recordingWasEnabled =
+    meeting?.data?.screenRecordingEnabled || meeting?.data?.audioRecordingEnabled;
+
+  useEffect(() => {
+    if (
+      meeting?.status !== "completed" ||
+      hasRecordings ||
+      !recordingWasEnabled ||
+      meetingRetryCount >= 8
+    ) {
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        const updated = await api.getMeetingById(meetingId);
+        if (
+          updated.data?.screenRecordingPath ||
+          updated.data?.audioRecordingPath
+        ) {
+          setMeeting(updated);
+        } else {
+          setMeetingRetryCount((c) => c + 1);
+        }
+      } catch {
+        setMeetingRetryCount((c) => c + 1);
+      }
+    }, 3000);
+
+    return () => clearTimeout(timer);
+  }, [
+    meeting?.status,
+    meetingId,
+    hasRecordings,
+    recordingWasEnabled,
+    meetingRetryCount,
+  ]);
 
   const handleStop = async () => {
     if (!meeting) return;

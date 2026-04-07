@@ -2012,6 +2012,28 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       // Ignore
     }
 
+    // Notify listeners about saved recording paths so they can persist them.
+    // This fires AFTER recordings are on disk, solving the race condition where
+    // handleMeetingEnded checks for files before stopBot has written them.
+    if (bot.storagePath) {
+      const savedRecordings: Record<string, string> = {};
+      const recDir = path.join(bot.storagePath, meetingKey);
+      const screenFile = path.join(recDir, 'screen.webm');
+      const audioFile = path.join(recDir, 'audio.webm');
+      if (fs.existsSync(screenFile)) {
+        savedRecordings.screenRecordingPath = screenFile;
+      }
+      if (fs.existsSync(audioFile) && fs.statSync(audioFile).size > 0) {
+        savedRecordings.audioRecordingPath = audioFile;
+      }
+      if (Object.keys(savedRecordings).length > 0) {
+        this.logger.log(
+          `Emitting recordings_saved for ${meetingKey}: ${JSON.stringify(savedRecordings)}`,
+        );
+        bot.emitter.emit('recordings_saved', savedRecordings);
+      }
+    }
+
     this.activeBots.delete(meetingKey);
     this.logger.log(`Bot stopped for meeting ${meetingKey}`);
   }

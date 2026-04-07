@@ -206,6 +206,27 @@ export class BotsService {
       );
       await this.setMeetingStatus(meetingId, meetingKey, MeetingStatus.FAILED);
     });
+
+    // ── Recordings saved (emitted by GoogleMeetBotService.stopBot AFTER
+    //    files are on disk — avoids the race where handleMeetingEnded
+    //    checks for files before they exist) ─────────────────────────
+    emitter.on('recordings_saved', async (paths: Record<string, string>) => {
+      try {
+        const meetingForUpdate = await this.meetingsRepository.findOne({ where: { id: meetingId } });
+        if (meetingForUpdate) {
+          await this.meetingsRepository.update(meetingId, {
+            data: { ...meetingForUpdate.data, ...paths },
+          });
+          this.logger.log(
+            `Recording paths saved for ${meetingId}: ${JSON.stringify(paths)}`,
+          );
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to save recording paths for ${meetingId}: ${error.message}`,
+        );
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -375,31 +396,13 @@ export class BotsService {
         });
       }
 
-      // Save recording file paths to meeting data if they exist.
-      // Only two output files: screen.webm (video+audio merged) and audio.webm.
-      const storagePath = resolveStoragePath(this.configService);
-      const recordingDir = path.join(storagePath, meetingId);
-      const recordingUpdates: Record<string, string> = {};
-
-      const screenPath = path.join(recordingDir, 'screen.webm');
-      if (fs.existsSync(screenPath)) {
-        recordingUpdates.screenRecordingPath = screenPath;
-        this.logger.log(`Screen recording found: ${screenPath}`);
-      }
-
-      const audioPath = path.join(recordingDir, 'audio.webm');
-      if (fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0) {
-        recordingUpdates.audioRecordingPath = audioPath;
-        this.logger.log(`Audio recording found: ${audioPath}`);
-      }
-
-      const meetingForUpdate = await this.meetingsRepository.findOne({ where: { id: meetingId } });
+      // NOTE: Recording file paths are NOT checked here because
+      // GoogleMeetBotService.stopBot (which saves recordings) runs concurrently
+      // with this handler. Recording paths are persisted via the 'recordings_saved'
+      // event emitted by stopBot AFTER files are on disk.
       await this.meetingsRepository.update(meetingId, {
         status: MeetingStatus.COMPLETED,
         endTime: new Date(),
-        ...(Object.keys(recordingUpdates).length > 0 && meetingForUpdate
-          ? { data: { ...meetingForUpdate.data, ...recordingUpdates } }
-          : {}),
       });
 
       this.meetingStartTimes.delete(meetingId);
