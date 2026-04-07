@@ -82,5 +82,19 @@ export class AdminSeedService implements OnModuleInit {
         `Seeded app setting: registration_enabled = ${registrationEnabled}`,
       );
     }
+
+    // Seed recording retention days (default: 30 days, 0 = keep forever)
+    const retentionKey = 'recording_retention_days';
+    const existingRetention = await this.appSettingsRepository.findOne({
+      where: { key: retentionKey },
+    });
+
+    if (!existingRetention) {
+      await this.appSettingsRepository.save({
+        key: retentionKey,
+        value: '30',
+      });
+      this.logger.log(`Seeded app setting: ${retentionKey} = 30`);
+    }
   }
 }

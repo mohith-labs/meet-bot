@@ -94,23 +94,35 @@ export class MeetingsController {
     @CurrentUser() user: any,
     @Param('id') id: string,
     @Param('type') type: string,
+    @Query('download') download: string,
     @Res() res: Response,
   ) {
-    if (type !== 'screen' && type !== 'audio') {
+    const typeMap: Record<string, string> = {
+      screen: 'screenRecordingPath',
+      audio: 'audioRecordingPath',
+    };
+
+    if (!typeMap[type]) {
       throw new NotFoundException('Invalid recording type. Use "screen" or "audio".');
     }
 
     const meeting = await this.meetingsService.findByIdForUser(user.id, id);
-    const pathKey = type === 'screen' ? 'screenRecordingPath' : 'audioRecordingPath';
-    const filePath = meeting.data?.[pathKey];
+    const filePath = meeting.data?.[typeMap[type]];
 
     if (!filePath || !fs.existsSync(filePath)) {
       throw new NotFoundException('Recording not found');
     }
 
+    const isAudio = type === 'audio';
+    const contentType = isAudio ? 'audio/webm' : 'video/webm';
     const filename = `${type}-recording-${id}.webm`;
-    res.setHeader('Content-Type', 'video/webm');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    res.setHeader('Content-Type', contentType);
+    if (download === 'true') {
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    } else {
+      res.setHeader('Content-Disposition', 'inline');
+    }
     res.sendFile(path.resolve(filePath));
   }
 

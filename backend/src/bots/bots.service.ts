@@ -375,7 +375,8 @@ export class BotsService {
         });
       }
 
-      // Save recording file paths to meeting data if they exist
+      // Save recording file paths to meeting data if they exist.
+      // Only two output files: screen.webm (video+audio merged) and audio.webm.
       const storagePath = resolveStoragePath(this.configService);
       const recordingDir = path.join(storagePath, meetingId);
       const recordingUpdates: Record<string, string> = {};
@@ -383,13 +384,13 @@ export class BotsService {
       const screenPath = path.join(recordingDir, 'screen.webm');
       if (fs.existsSync(screenPath)) {
         recordingUpdates.screenRecordingPath = screenPath;
-        this.logger.log(`Screen recording saved: ${screenPath}`);
+        this.logger.log(`Screen recording found: ${screenPath}`);
       }
 
       const audioPath = path.join(recordingDir, 'audio.webm');
-      if (fs.existsSync(audioPath)) {
+      if (fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0) {
         recordingUpdates.audioRecordingPath = audioPath;
-        this.logger.log(`Audio recording saved: ${audioPath}`);
+        this.logger.log(`Audio recording found: ${audioPath}`);
       }
 
       const meetingForUpdate = await this.meetingsRepository.findOne({ where: { id: meetingId } });

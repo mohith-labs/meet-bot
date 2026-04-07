@@ -49,8 +49,6 @@ interface ActiveBot {
   screenRecordingEnabled: boolean;
   /** Whether audio recording is enabled for this bot */
   audioRecordingEnabled: boolean;
-  /** Write stream for audio recording chunks */
-  audioStream?: fs.WriteStream;
   /** Storage path for this bot's recordings */
   storagePath?: string;
 }
@@ -99,7 +97,11 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         ? options.authStatePath
         : this.resolveAuthPath();
 
-      // Launch Playwright Chromium with Google Meet-optimized flags
+      // Launch Playwright Chromium in headed mode.
+      // Audio recording requires a real audio output pipeline — headless
+      // Chromium has NO audio sink, so AudioContext/MediaRecorder produce
+      // silence.  In Docker, Xvfb + PulseAudio provide virtual display
+      // and audio.
       const browser = await chromium.launch({
         headless: true,
         args: [
@@ -188,6 +190,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       permissions: ['microphone', 'camera'],
       locale: 'en-US',
+      acceptDownloads: true,  // Required for audio recording save via download API
     };
 
     if (options.authPath) {
@@ -322,11 +325,6 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       this.logger.log('Switched to guest mode successfully');
     }
 
-    // Set up audio recording bridge function (after navigation, captures chunks)
-    if (bot.audioRecordingEnabled && bot.storagePath) {
-      await this.setupAudioRecordingBridge(page, meetingKey);
-    }
-
     // Step 2: Turn off mic and camera on the pre-join page
     await this.turnOffMediaDevices(page);
 
@@ -366,6 +364,33 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
     // Step 12: Monitor participant count for auto-exit when alone
     this.monitorParticipants(page, meetingKey, emitter);
+
+    // Step 13: Log audio recording diagnostics (delayed so tracks have time to arrive)
+    if (bot.audioRecordingEnabled) {
+      setTimeout(async () => {
+        try {
+          const audioStatus = await page.evaluate(() => ({
+            trackCount: (window as any).__meetbot_trackCount || 0,
+            contextState: (window as any).__meetbot_audioContext?.state || 'not created',
+            recorderState: (window as any).__meetbot_audioRecorder?.state || 'not created',
+            sourceCount: ((window as any).__meetbot_audioSources || []).length,
+            chunkCount: (window as any).__meetbot_chunkCount || 0,
+            ready: (window as any).__meetbot_audioReady || false,
+          }));
+          this.logger.log(`Audio recording diagnostics: ${JSON.stringify(audioStatus)}`);
+          if (audioStatus.trackCount === 0) {
+            this.logger.warn(
+              'No audio tracks received — RTCPeerConnection patch may not be intercepting tracks',
+            );
+          }
+          if (audioStatus.contextState === 'suspended') {
+            this.logger.warn('AudioContext is still suspended — audio will be silent');
+          }
+        } catch {
+          // Page may have closed
+        }
+      }, 15_000); // 15s after join — enough time for WebRTC to establish
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -379,12 +404,16 @@ export class GoogleMeetBotService implements OnModuleDestroy {
    */
   private async setupAudioRecordingInitScript(page: Page): Promise<void> {
     await page.addInitScript(() => {
-      // Globals for audio capture
+      // Globals for audio capture — Blobs are collected in-memory and saved
+      // at the end via Playwright's download API (avoids base64 corruption).
       (window as any).__meetbot_audioContext = null;
       (window as any).__meetbot_audioDestination = null;
       (window as any).__meetbot_audioRecorder = null;
       (window as any).__meetbot_audioSources = [];
+      (window as any).__meetbot_audioChunks = [] as Blob[];
       (window as any).__meetbot_audioReady = false;
+      (window as any).__meetbot_trackCount = 0;
+      (window as any).__meetbot_chunkCount = 0;
 
       // Patch RTCPeerConnection to intercept incoming audio tracks
       const OriginalRTC = window.RTCPeerConnection;
@@ -394,17 +423,37 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
         pc.addEventListener('track', (event: RTCTrackEvent) => {
           if (event.track.kind === 'audio') {
+            (window as any).__meetbot_trackCount++;
+            console.log(
+              `[MeetBot] Audio track received (#${(window as any).__meetbot_trackCount}), readyState=${event.track.readyState}`,
+            );
+
             try {
               if (!(window as any).__meetbot_audioContext) {
-                (window as any).__meetbot_audioContext = new AudioContext();
-                (window as any).__meetbot_audioDestination =
-                  (window as any).__meetbot_audioContext.createMediaStreamDestination();
+                const ctx = new AudioContext();
+                // CRITICAL: Explicitly resume — AudioContext may start suspended
+                if (ctx.state === 'suspended') {
+                  ctx.resume().catch(() => {});
+                  console.log('[MeetBot] AudioContext was suspended, resuming...');
+                }
+                console.log(`[MeetBot] AudioContext created, state=${ctx.state}`);
+                (window as any).__meetbot_audioContext = ctx;
+                (window as any).__meetbot_audioDestination = ctx.createMediaStreamDestination();
+              }
+
+              // Ensure AudioContext is running before connecting sources
+              const ctx = (window as any).__meetbot_audioContext;
+              if (ctx.state === 'suspended') {
+                ctx.resume().catch(() => {});
               }
 
               const stream = new MediaStream([event.track]);
-              const source = (window as any).__meetbot_audioContext.createMediaStreamSource(stream);
+              const source = ctx.createMediaStreamSource(stream);
               source.connect((window as any).__meetbot_audioDestination);
               (window as any).__meetbot_audioSources.push(source);
+              console.log(
+                `[MeetBot] Audio source connected (total: ${(window as any).__meetbot_audioSources.length})`,
+              );
 
               // Start recorder if not already started
               if (
@@ -412,25 +461,28 @@ export class GoogleMeetBotService implements OnModuleDestroy {
                 (window as any).__meetbot_audioDestination
               ) {
                 try {
+                  // Detect supported mimeType with fallback
+                  const mimeType =
+                    typeof MediaRecorder !== 'undefined' &&
+                    MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                      ? 'audio/webm;codecs=opus'
+                      : 'audio/webm';
+                  console.log(`[MeetBot] Using mimeType: ${mimeType}`);
+
                   const recorder = new MediaRecorder(
                     (window as any).__meetbot_audioDestination.stream,
-                    { mimeType: 'audio/webm;codecs=opus' },
+                    { mimeType },
                   );
-                  recorder.ondataavailable = async (e: BlobEvent) => {
-                    if (e.data.size > 0 && typeof (window as any).__meetbot_onAudioChunk === 'function') {
-                      const buffer = await e.data.arrayBuffer();
-                      const bytes = new Uint8Array(buffer);
-                      let binary = '';
-                      for (let i = 0; i < bytes.length; i++) {
-                        binary += String.fromCharCode(bytes[i]);
-                      }
-                      (window as any).__meetbot_onAudioChunk(btoa(binary));
+                  recorder.ondataavailable = (e: BlobEvent) => {
+                    if (e.data.size > 0) {
+                      (window as any).__meetbot_audioChunks.push(e.data);
+                      (window as any).__meetbot_chunkCount++;
                     }
                   };
                   recorder.start(5000); // 5-second chunks
                   (window as any).__meetbot_audioRecorder = recorder;
                   (window as any).__meetbot_audioReady = true;
-                  console.log('[MeetBot] Audio recorder started');
+                  console.log(`[MeetBot] Audio recorder started, state=${recorder.state}`);
                 } catch (recErr) {
                   console.error('[MeetBot] Failed to start audio recorder:', recErr);
                 }
@@ -464,43 +516,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       }
 
       (window as any).RTCPeerConnection = PatchedRTC;
+      console.log('[MeetBot] RTCPeerConnection patched for audio capture');
     });
     this.logger.log('Audio recording init script injected');
-  }
-
-  /**
-   * Set up the bridge function that receives audio chunks from the page
-   * and writes them to a file via a WriteStream.
-   */
-  private async setupAudioRecordingBridge(
-    page: Page,
-    meetingKey: string,
-  ): Promise<void> {
-    const bot = this.activeBots.get(meetingKey);
-    if (!bot || !bot.storagePath) return;
-
-    const recordingDir = getRecordingDir(bot.storagePath, meetingKey);
-    const audioPath = path.join(recordingDir, 'audio.webm');
-    const audioStream = fs.createWriteStream(audioPath);
-    bot.audioStream = audioStream;
-
-    try {
-      await page.exposeFunction('__meetbot_onAudioChunk', (base64Chunk: string) => {
-        try {
-          const buffer = Buffer.from(base64Chunk, 'base64');
-          audioStream.write(buffer);
-        } catch {
-          // Ignore write errors
-        }
-      });
-      this.logger.log(`Audio recording bridge exposed → ${audioPath}`);
-    } catch (err: any) {
-      if (err.message?.includes('already been registered')) {
-        this.logger.debug('Audio bridge already registered');
-      } else {
-        this.logger.error(`Failed to expose audio bridge: ${err.message}`);
-      }
-    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1694,24 +1712,59 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     if (bot.captionHealthInterval) clearInterval(bot.captionHealthInterval);
     if (bot.hardTimeoutTimer) clearTimeout(bot.hardTimeoutTimer);
 
-    // Stop audio recorder in the page (with 3s timeout to prevent hang)
-    if (bot.audioStream) {
+    // Save audio recording: stop MediaRecorder, combine Blobs in browser,
+    // trigger a download, and save via Playwright's download API.
+    // This avoids base64 encoding issues that corrupt binary WebM data.
+    if (bot.audioRecordingEnabled && bot.storagePath) {
       try {
+        const recordingDir = getRecordingDir(bot.storagePath, meetingKey);
+        const audioPath = path.join(recordingDir, 'audio.webm');
+
+        // Stop the recorder and wait for the final ondataavailable event
         await Promise.race([
           bot.page.evaluate(() => {
-            if ((window as any).__meetbot_audioRecorder) {
-              (window as any).__meetbot_audioRecorder.stop();
-            }
+            return new Promise<void>((resolve) => {
+              const recorder = (window as any).__meetbot_audioRecorder;
+              if (recorder && recorder.state === 'recording') {
+                recorder.onstop = () => resolve();
+                recorder.stop();
+              } else {
+                resolve();
+              }
+            });
           }),
-          new Promise(resolve => setTimeout(resolve, 3000)),
+          new Promise(resolve => setTimeout(resolve, 5000)),
         ]);
-        // Wait briefly for final chunks to arrive via the bridge
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      } catch {
-        // Page might already be closed
+
+        // Check how many chunks were collected
+        const chunkCount = await bot.page.evaluate(
+          () => ((window as any).__meetbot_audioChunks || []).length,
+        );
+        this.logger.log(`Audio recording: ${chunkCount} chunks collected for ${meetingKey}`);
+
+        if (chunkCount > 0) {
+          // Trigger a download of the combined audio Blob from inside the page
+          const [download] = await Promise.all([
+            bot.page.waitForEvent('download', { timeout: 15_000 }),
+            bot.page.evaluate(() => {
+              const chunks: Blob[] = (window as any).__meetbot_audioChunks || [];
+              const blob = new Blob(chunks, { type: 'audio/webm' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = 'audio.webm';
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+            }),
+          ]);
+          await download.saveAs(audioPath);
+          this.logger.log(`Audio recording saved via download: ${audioPath}`);
+        }
+      } catch (err: any) {
+        this.logger.warn(`Failed to save audio recording: ${err.message}`);
       }
-      bot.audioStream.end();
-      this.logger.log(`Audio recording stream closed for ${meetingKey}`);
     }
 
     // Capture video reference BEFORE closing context — video.saveAs() can
@@ -1759,18 +1812,48 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       // Ignore
     }
 
-    // Save screen recording AFTER context close (video file is now finalised)
+    // Save screen recording AFTER context close, then merge with audio.
+    // Playwright's recordVideo produces video-only frames.  If audio.webm
+    // also exists we merge them with ffmpeg into a single screen.webm that
+    // has both video and audio.  The temp video-only file is deleted.
     if (videoRef && bot.storagePath) {
       try {
         const recordingDir = getRecordingDir(bot.storagePath, meetingKey);
+        const videoOnlyPath = path.join(recordingDir, '_video_tmp.webm');
         const screenPath = path.join(recordingDir, 'screen.webm');
+        const audioPath = path.join(recordingDir, 'audio.webm');
+
+        // Save the Playwright video frames to a temp file
         await Promise.race([
-          videoRef.saveAs(screenPath),
+          videoRef.saveAs(videoOnlyPath),
           new Promise((_, reject) =>
             setTimeout(() => reject(new Error('video.saveAs timed out')), 10_000),
           ),
         ]);
-        this.logger.log(`Screen recording saved: ${screenPath}`);
+        this.logger.log(`Playwright video saved to temp: ${videoOnlyPath}`);
+
+        // Merge video + audio into screen.webm (if audio exists)
+        const hasAudio = fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0;
+        if (hasAudio) {
+          try {
+            const { execSync } = require('child_process');
+            execSync(
+              `ffmpeg -y -i "${videoOnlyPath}" -i "${audioPath}" -c:v copy -c:a copy -shortest "${screenPath}"`,
+              { timeout: 120_000, stdio: 'pipe' },
+            );
+            // Remove temp video-only file
+            fs.unlinkSync(videoOnlyPath);
+            this.logger.log(`Screen recording (video+audio) saved: ${screenPath}`);
+          } catch (mergeErr: any) {
+            // ffmpeg failed — fall back to video-only as screen.webm
+            this.logger.warn(`ffmpeg merge failed: ${mergeErr.message}. Using video-only.`);
+            fs.renameSync(videoOnlyPath, screenPath);
+          }
+        } else {
+          // No audio — just rename the video-only file to screen.webm
+          fs.renameSync(videoOnlyPath, screenPath);
+          this.logger.log(`Screen recording (video only) saved: ${screenPath}`);
+        }
       } catch (err: any) {
         this.logger.warn(`Failed to save screen recording: ${err.message}`);
       }

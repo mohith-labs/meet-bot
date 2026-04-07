@@ -30,6 +30,7 @@ import {
   type MeetingStatus,
   type TranscriptSegment,
 } from "@/lib/api";
+import { getToken } from "@/lib/auth";
 interface TranscriptEntry {
   id: string;
   speaker: string;
@@ -363,52 +364,7 @@ export default function MeetingDetailPage() {
       )}
 
       {/* Recordings Section */}
-      {(meeting.data?.screenRecordingPath || meeting.data?.audioRecordingPath || 
-        (isLive && (meeting.data?.screenRecordingEnabled || meeting.data?.audioRecordingEnabled))) && (
-        <Card padding="sm">
-          <div className="flex items-center gap-2 mb-3">
-            <Video className="h-4 w-4 text-brand-primary" />
-            <h3 className="text-sm font-semibold text-text-primary">Recordings</h3>
-          </div>
-          <div className="flex flex-wrap gap-3">
-            {meeting.data?.screenRecordingPath ? (
-              <a
-                href={api.getRecordingUrl(meeting.id, "screen")}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border hover:border-brand-primary/50 transition-colors text-sm text-text-primary"
-              >
-                <Monitor className="h-4 w-4 text-brand-primary" />
-                Screen Recording
-                <Download className="h-3.5 w-3.5 text-text-muted" />
-              </a>
-            ) : meeting.data?.screenRecordingEnabled && isLive ? (
-              <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border text-sm text-text-muted">
-                <Monitor className="h-4 w-4" />
-                Screen recording in progress...
-              </div>
-            ) : null}
-
-            {meeting.data?.audioRecordingPath ? (
-              <a
-                href={api.getRecordingUrl(meeting.id, "audio")}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border hover:border-brand-primary/50 transition-colors text-sm text-text-primary"
-              >
-                <Mic className="h-4 w-4 text-brand-primary" />
-                Audio Recording
-                <Download className="h-3.5 w-3.5 text-text-muted" />
-              </a>
-            ) : meeting.data?.audioRecordingEnabled && isLive ? (
-              <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border text-sm text-text-muted">
-                <Mic className="h-4 w-4" />
-                Audio recording in progress...
-              </div>
-            ) : null}
-          </div>
-        </Card>
-      )}
+      <RecordingsSection meeting={meeting} isLive={isLive} />
 
       {/* Share URL */}
       {shareUrl && (
@@ -547,4 +503,159 @@ function formatTimestamp(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+// ---------------------------------------------------------------------------
+// Recordings section — fetches blob with auth and renders media players
+// ---------------------------------------------------------------------------
+
+function RecordingsSection({
+  meeting,
+  isLive,
+}: {
+  meeting: Meeting;
+  isLive: boolean;
+}) {
+  const [screenUrl, setScreenUrl] = useState<string | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const hasScreen = !!meeting.data?.screenRecordingPath;
+  const hasAudio = !!meeting.data?.audioRecordingPath;
+  const hasAnyRecording = hasScreen || hasAudio;
+  const isRecording =
+    isLive &&
+    (meeting.data?.screenRecordingEnabled || meeting.data?.audioRecordingEnabled);
+
+  useEffect(() => {
+    if (!hasAnyRecording) return;
+
+    let cancelled = false;
+    setLoading(true);
+
+    async function fetchBlob(
+      type: "screen" | "audio"
+    ): Promise<string | null> {
+      try {
+        const token = getToken();
+        const res = await fetch(api.getRecordingUrl(meeting.id, type), {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        return URL.createObjectURL(blob);
+      } catch {
+        return null;
+      }
+    }
+
+    (async () => {
+      if (hasScreen) {
+        const url = await fetchBlob("screen");
+        if (!cancelled) setScreenUrl(url);
+      }
+      if (hasAudio) {
+        const url = await fetchBlob("audio");
+        if (!cancelled) setAudioUrl(url);
+      }
+      if (!cancelled) setLoading(false);
+    })();
+
+    return () => {
+      cancelled = true;
+      if (screenUrl) URL.revokeObjectURL(screenUrl);
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meeting.id, hasScreen, hasAudio]);
+
+  if (!hasAnyRecording && !isRecording) return null;
+
+  return (
+    <Card padding="sm">
+      <div className="flex items-center gap-2 mb-3">
+        <Video className="h-4 w-4 text-brand-primary" />
+        <h3 className="text-sm font-semibold text-text-primary">Recordings</h3>
+      </div>
+
+      {loading && (
+        <div className="flex items-center gap-2 py-4 text-sm text-text-muted">
+          <div className="h-4 w-4 border-2 border-brand-primary border-t-transparent rounded-full animate-spin" />
+          Loading recordings...
+        </div>
+      )}
+
+      <div className="space-y-4">
+        {/* Screen recording (video + audio merged via ffmpeg) */}
+        {screenUrl && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Monitor className="h-4 w-4 text-brand-primary" />
+                <span className="text-sm font-medium text-text-primary">
+                  Screen Recording
+                </span>
+              </div>
+              <a
+                href={
+                  api.getRecordingUrl(meeting.id, "screen") + "?download=true"
+                }
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium text-text-secondary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
+              >
+                <Download className="h-3.5 w-3.5" />
+                Download
+              </a>
+            </div>
+            <video
+              controls
+              className="w-full rounded-lg border border-border bg-black"
+              src={screenUrl}
+            />
+          </div>
+        )}
+
+        {/* Audio recording */}
+        {audioUrl && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Mic className="h-4 w-4 text-brand-primary" />
+                <span className="text-sm font-medium text-text-primary">
+                  Audio Recording
+                </span>
+              </div>
+              <a
+                href={
+                  api.getRecordingUrl(meeting.id, "audio") + "?download=true"
+                }
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium text-text-secondary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
+              >
+                <Download className="h-3.5 w-3.5" />
+                Download
+              </a>
+            </div>
+            <audio controls className="w-full" src={audioUrl} />
+          </div>
+        )}
+
+        {/* In-progress indicators */}
+        {isRecording && !hasAnyRecording && (
+          <div className="flex flex-wrap gap-3">
+            {meeting.data?.screenRecordingEnabled && (
+              <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border text-sm text-text-muted">
+                <Monitor className="h-4 w-4" />
+                Screen recording in progress...
+              </div>
+            )}
+            {meeting.data?.audioRecordingEnabled && (
+              <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border text-sm text-text-muted">
+                <Mic className="h-4 w-4" />
+                Audio recording in progress...
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
 }

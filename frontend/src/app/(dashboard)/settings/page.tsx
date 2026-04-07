@@ -91,6 +91,8 @@ export default function SettingsPage() {
   const [registrationEnabled, setRegistrationEnabled] = useState(true);
   const [isLoadingAdminSettings, setIsLoadingAdminSettings] = useState(false);
   const [isTogglingRegistration, setIsTogglingRegistration] = useState(false);
+  const [retentionDays, setRetentionDays] = useState(30);
+  const [isSavingRetention, setIsSavingRetention] = useState(false);
 
   // ── Bot settings state ──────────────────────────────────────────────────
   const [settings, setSettings] = useState<UserSettings | null>(null);
@@ -176,6 +178,7 @@ export default function SettingsPage() {
     try {
       const data = await api.adminGetSettings();
       setRegistrationEnabled(data.registration_enabled === "true");
+      setRetentionDays(parseInt(data.recording_retention_days || "30", 10));
     } catch {
       setRegistrationEnabled(true);
     } finally {
@@ -310,6 +313,25 @@ export default function SettingsPage() {
       toast.error(err.message || "Failed to update registration settings");
     } finally {
       setIsTogglingRegistration(false);
+    }
+  };
+
+  // ── Admin: save recording retention days ────────────────────────────────
+  const handleSaveRetention = async () => {
+    setIsSavingRetention(true);
+    try {
+      await api.adminUpdateSettings({
+        recording_retention_days: String(Math.max(0, retentionDays)),
+      });
+      toast.success(
+        retentionDays <= 0
+          ? "Recordings will be kept forever"
+          : `Recordings will be kept for ${retentionDays} days`
+      );
+    } catch (err: any) {
+      toast.error(err.message || "Failed to update retention settings");
+    } finally {
+      setIsSavingRetention(false);
     }
   };
 
@@ -760,6 +782,56 @@ export default function SettingsPage() {
                       }`}
                     />
                   </button>
+                </div>
+              )}
+            </div>
+
+            {/* ── App Settings: Recording Retention ──────────────────────── */}
+            <div className="mt-6 pt-4 border-t border-[#2a2a3e]">
+              <h3 className="text-sm font-semibold text-[#e4e4f0] flex items-center gap-2 mb-3">
+                <Clock className="h-4 w-4 text-amber-400" />
+                Recording Retention
+              </h3>
+
+              {isLoadingAdminSettings ? (
+                <div className="flex items-center justify-center py-4">
+                  <div className="h-5 w-5 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+                </div>
+              ) : (
+                <div className="flex items-center justify-between p-4 rounded-lg border border-amber-500/20 bg-amber-500/5">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <Trash2 className="h-4 w-4 text-amber-400" />
+                      <p className="text-sm font-medium text-[#e4e4f0]">
+                        Days to retain recordings
+                      </p>
+                    </div>
+                    <p className="text-xs text-text-secondary mt-1 ml-6">
+                      Recording files older than this will be auto-deleted. Set
+                      to 0 to keep forever.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min="0"
+                      max="3650"
+                      value={retentionDays}
+                      onChange={(e) =>
+                        setRetentionDays(
+                          Math.max(0, parseInt(e.target.value, 10) || 0)
+                        )
+                      }
+                      className="w-20 bg-[#1e1e36] border border-[#2a2a3e] rounded-lg px-3 py-1.5 text-sm text-[#e4e4f0] text-center focus:outline-none focus:ring-2 focus:ring-amber-500/50 focus:border-amber-500"
+                    />
+                    <Button
+                      size="sm"
+                      onClick={handleSaveRetention}
+                      isLoading={isSavingRetention}
+                    >
+                      Save
+                    </Button>
+                  </div>
                 </div>
               )}
             </div>
