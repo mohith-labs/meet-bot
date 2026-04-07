@@ -44,11 +44,27 @@ export class CreateBotDto {
 
   @ApiPropertyOptional({
     example: true,
-    description: 'Whether to record the meeting',
+    description: 'Whether to record the meeting (legacy — use screenRecordingEnabled / audioRecordingEnabled)',
   })
   @IsBoolean()
   @IsOptional()
   recordingEnabled?: boolean;
+
+  @ApiPropertyOptional({
+    example: true,
+    description: 'Whether to record the screen (default: true)',
+  })
+  @IsBoolean()
+  @IsOptional()
+  screenRecordingEnabled?: boolean;
+
+  @ApiPropertyOptional({
+    example: true,
+    description: 'Whether to record audio (default: true)',
+  })
+  @IsBoolean()
+  @IsOptional()
+  audioRecordingEnabled?: boolean;
 
   @ApiPropertyOptional({
     example: true,
@@ -65,10 +81,20 @@ export class UpdateBotConfigDto {
   @IsOptional()
   language?: string;
 
-  @ApiPropertyOptional({ example: true, description: 'Whether recording is enabled' })
+  @ApiPropertyOptional({ example: true, description: 'Whether recording is enabled (legacy)' })
   @IsBoolean()
   @IsOptional()
   recordingEnabled?: boolean;
+
+  @ApiPropertyOptional({ example: true, description: 'Whether screen recording is enabled' })
+  @IsBoolean()
+  @IsOptional()
+  screenRecordingEnabled?: boolean;
+
+  @ApiPropertyOptional({ example: true, description: 'Whether audio recording is enabled' })
+  @IsBoolean()
+  @IsOptional()
+  audioRecordingEnabled?: boolean;
 
   @ApiPropertyOptional({ example: true, description: 'Whether transcription is enabled' })
   @IsBoolean()

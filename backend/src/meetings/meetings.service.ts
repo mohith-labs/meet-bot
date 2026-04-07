@@ -18,6 +18,49 @@ export class MeetingsService {
     });
   }
 
+  async listByUserPaginated(
+    userId: string,
+    page: number = 1,
+    limit: number = 20,
+    status?: string,
+    search?: string,
+  ): Promise<{
+    meetings: Meeting[];
+    meta: { page: number; limit: number; total: number; totalPages: number };
+  }> {
+    const qb = this.meetingsRepository
+      .createQueryBuilder('meeting')
+      .where('meeting.userId = :userId', { userId })
+      .orderBy('meeting.createdAt', 'DESC');
+
+    if (status) {
+      qb.andWhere('meeting.status = :status', { status });
+    }
+
+    if (search) {
+      qb.andWhere(
+        '(meeting.nativeMeetingId LIKE :search OR meeting.data LIKE :search)',
+        { search: `%${search}%` },
+      );
+    }
+
+    const total = await qb.getCount();
+    const meetings = await qb
+      .skip((page - 1) * limit)
+      .take(limit)
+      .getMany();
+
+    return {
+      meetings,
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
   async findByPlatformAndId(
     userId: string,
     platform: MeetingPlatform,

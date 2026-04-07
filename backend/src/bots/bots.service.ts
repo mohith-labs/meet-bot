@@ -11,6 +11,8 @@ import { Repository, In } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
+import * as path from 'path';
+import * as fs from 'fs';
 import {
   Meeting,
   MeetingPlatform,
@@ -23,6 +25,7 @@ import { TranscriptGateway } from '../websocket/transcript.gateway';
 import { WebhookDispatcherService } from '../webhooks/webhook-dispatcher.service';
 import { UsersService } from '../users/users.service';
 import { BotAuthService } from '../settings/bot-auth.service';
+import { resolveStoragePath, getRecordingDir } from '../config/storage.config';
 
 @Injectable()
 export class BotsService {
@@ -111,6 +114,8 @@ export class BotsService {
         botName,
         language: createBotDto.language || 'en',
         recordingEnabled: createBotDto.recordingEnabled ?? false,
+        screenRecordingEnabled: createBotDto.screenRecordingEnabled ?? true,
+        audioRecordingEnabled: createBotDto.audioRecordingEnabled ?? true,
         transcribeEnabled: createBotDto.transcribeEnabled ?? true,
       },
     });
@@ -124,7 +129,7 @@ export class BotsService {
     );
 
     // Launch the real bot (async — doesn't block the response)
-    this.launchBot(meetingId, meetingKey, constructedMeetingUrl, botName, userId);
+    this.launchBot(meetingId, meetingKey, constructedMeetingUrl, botName, userId, savedMeeting);
 
     return savedMeeting;
   }
@@ -139,6 +144,7 @@ export class BotsService {
     meetingUrl: string,
     botName: string,
     userId: string,
+    meeting?: Meeting,
   ): Promise<void> {
     let emitter: EventEmitter;
 
@@ -151,6 +157,11 @@ export class BotsService {
     // Resolve per-user auth file path
     const authStatePath = this.botAuthService.resolveAuthPathForUser(userId);
 
+    // Resolve recording settings from meeting data
+    const screenRecordingEnabled = meeting?.data?.screenRecordingEnabled ?? true;
+    const audioRecordingEnabled = meeting?.data?.audioRecordingEnabled ?? true;
+    const storagePath = resolveStoragePath(this.configService);
+
     try {
       emitter = await this.googleMeetBotService.joinMeeting({
         meetingUrl,
@@ -158,6 +169,9 @@ export class BotsService {
         meetingKey: meetingId, // use DB ID as the unique key inside GoogleMeetBotService
         autoExitMinutes,
         authStatePath,
+        screenRecordingEnabled,
+        audioRecordingEnabled,
+        storagePath,
       });
     } catch (error) {
       this.logger.error(
@@ -361,9 +375,30 @@ export class BotsService {
         });
       }
 
+      // Save recording file paths to meeting data if they exist
+      const storagePath = resolveStoragePath(this.configService);
+      const recordingDir = path.join(storagePath, meetingId);
+      const recordingUpdates: Record<string, string> = {};
+
+      const screenPath = path.join(recordingDir, 'screen.webm');
+      if (fs.existsSync(screenPath)) {
+        recordingUpdates.screenRecordingPath = screenPath;
+        this.logger.log(`Screen recording saved: ${screenPath}`);
+      }
+
+      const audioPath = path.join(recordingDir, 'audio.webm');
+      if (fs.existsSync(audioPath)) {
+        recordingUpdates.audioRecordingPath = audioPath;
+        this.logger.log(`Audio recording saved: ${audioPath}`);
+      }
+
+      const meetingForUpdate = await this.meetingsRepository.findOne({ where: { id: meetingId } });
       await this.meetingsRepository.update(meetingId, {
         status: MeetingStatus.COMPLETED,
         endTime: new Date(),
+        ...(Object.keys(recordingUpdates).length > 0 && meetingForUpdate
+          ? { data: { ...meetingForUpdate.data, ...recordingUpdates } }
+          : {}),
       });
 
       this.meetingStartTimes.delete(meetingId);
@@ -535,6 +570,12 @@ export class BotsService {
       ...(updateDto.language !== undefined && { language: updateDto.language }),
       ...(updateDto.recordingEnabled !== undefined && {
         recordingEnabled: updateDto.recordingEnabled,
+      }),
+      ...(updateDto.screenRecordingEnabled !== undefined && {
+        screenRecordingEnabled: updateDto.screenRecordingEnabled,
+      }),
+      ...(updateDto.audioRecordingEnabled !== undefined && {
+        audioRecordingEnabled: updateDto.audioRecordingEnabled,
       }),
       ...(updateDto.transcribeEnabled !== undefined && {
         transcribeEnabled: updateDto.transcribeEnabled,

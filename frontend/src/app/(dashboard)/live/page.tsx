@@ -16,6 +16,8 @@ import {
   Loader2,
   ExternalLink,
   Wifi,
+  Monitor,
+  Mic,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -94,6 +96,8 @@ export default function LivePage() {
   const [meetingUrl, setMeetingUrl] = useState("");
   const [botName, setBotName] = useState("MeetBot");
   const [language, setLanguage] = useState("en");
+  const [screenRecording, setScreenRecording] = useState(true);
+  const [audioRecording, setAudioRecording] = useState(true);
   const [isJoining, setIsJoining] = useState(false);
   const [urlError, setUrlError] = useState<string | null>(null);
   const [parsedMeetingId, setParsedMeetingId] = useState<string | null>(null);
@@ -152,6 +156,8 @@ export default function LivePage() {
         nativeMeetingId: parsed.nativeMeetingId,
         botName: botName || "MeetBot",
         language,
+        screenRecordingEnabled: screenRecording,
+        audioRecordingEnabled: audioRecording,
       });
 
       await fetchActiveBots();
@@ -259,6 +265,57 @@ export default function LivePage() {
                     </option>
                   ))}
                 </select>
+              </div>
+            </div>
+
+            {/* Recording Toggles */}
+            <div className="space-y-3 pt-1">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Monitor className="h-4 w-4 text-text-muted" />
+                  <span className="text-sm font-medium text-text-primary">
+                    Screen Recording
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={screenRecording}
+                  onClick={() => setScreenRecording(!screenRecording)}
+                  className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-brand-primary focus:ring-offset-2 focus:ring-offset-bg-primary ${
+                    screenRecording ? "bg-brand-primary" : "bg-bg-tertiary"
+                  }`}
+                >
+                  <span
+                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                      screenRecording ? "translate-x-5" : "translate-x-0"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Mic className="h-4 w-4 text-text-muted" />
+                  <span className="text-sm font-medium text-text-primary">
+                    Audio Recording
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={audioRecording}
+                  onClick={() => setAudioRecording(!audioRecording)}
+                  className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-brand-primary focus:ring-offset-2 focus:ring-offset-bg-primary ${
+                    audioRecording ? "bg-brand-primary" : "bg-bg-tertiary"
+                  }`}
+                >
+                  <span
+                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                      audioRecording ? "translate-x-5" : "translate-x-0"
+                    }`}
+                  />
+                </button>
               </div>
             </div>
 

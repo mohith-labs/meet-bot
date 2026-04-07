@@ -12,6 +12,9 @@ import {
   Trash2,
   ExternalLink,
   Globe,
+  Monitor,
+  Mic,
+  Download,
 } from "lucide-react";
 import { format } from "date-fns";
 import { Button } from "@/components/ui/button";
@@ -356,6 +359,54 @@ export default function MeetingDetailPage() {
             {meeting.constructedMeetingUrl}
           </a>
           <CopyButton text={meeting.constructedMeetingUrl} />
+        </Card>
+      )}
+
+      {/* Recordings Section */}
+      {(meeting.data?.screenRecordingPath || meeting.data?.audioRecordingPath || 
+        (isLive && (meeting.data?.screenRecordingEnabled || meeting.data?.audioRecordingEnabled))) && (
+        <Card padding="sm">
+          <div className="flex items-center gap-2 mb-3">
+            <Video className="h-4 w-4 text-brand-primary" />
+            <h3 className="text-sm font-semibold text-text-primary">Recordings</h3>
+          </div>
+          <div className="flex flex-wrap gap-3">
+            {meeting.data?.screenRecordingPath ? (
+              <a
+                href={api.getRecordingUrl(meeting.id, "screen")}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border hover:border-brand-primary/50 transition-colors text-sm text-text-primary"
+              >
+                <Monitor className="h-4 w-4 text-brand-primary" />
+                Screen Recording
+                <Download className="h-3.5 w-3.5 text-text-muted" />
+              </a>
+            ) : meeting.data?.screenRecordingEnabled && isLive ? (
+              <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border text-sm text-text-muted">
+                <Monitor className="h-4 w-4" />
+                Screen recording in progress...
+              </div>
+            ) : null}
+
+            {meeting.data?.audioRecordingPath ? (
+              <a
+                href={api.getRecordingUrl(meeting.id, "audio")}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border hover:border-brand-primary/50 transition-colors text-sm text-text-primary"
+              >
+                <Mic className="h-4 w-4 text-brand-primary" />
+                Audio Recording
+                <Download className="h-3.5 w-3.5 text-text-muted" />
+              </a>
+            ) : meeting.data?.audioRecordingEnabled && isLive ? (
+              <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-secondary border border-border text-sm text-text-muted">
+                <Mic className="h-4 w-4" />
+                Audio recording in progress...
+              </div>
+            ) : null}
+          </div>
         </Card>
       )}
 

@@ -73,7 +73,8 @@ export default function DashboardPage() {
         ]);
 
         if (meetingsRes.status === "fulfilled") {
-          const meetings = meetingsRes.value;
+          const result = meetingsRes.value;
+          const meetings = result.meetings;
           // Sort by createdAt desc and take first 5 for recent list
           const sorted = [...meetings].sort(
             (a, b) =>
@@ -90,7 +91,7 @@ export default function DashboardPage() {
 
           setStats((prev) => ({
             ...prev,
-            totalMeetings: meetings.length,
+            totalMeetings: result.meta.total,
             totalMinutes: Math.round(totalSeconds / 60),
           }));
         }

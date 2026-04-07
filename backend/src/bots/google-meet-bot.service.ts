@@ -4,6 +4,7 @@ import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { EventEmitter } from 'events';
 import * as path from 'path';
 import * as fs from 'fs';
+import { getRecordingDir } from '../config/storage.config';
 
 export interface CaptionEvent {
   speaker: string;
@@ -44,6 +45,14 @@ interface ActiveBot {
   bridgeExposed: boolean;
   /** Count of consecutive health-check recoveries (to avoid infinite re-enable loops) */
   recoveryCount: number;
+  /** Whether screen recording is enabled for this bot */
+  screenRecordingEnabled: boolean;
+  /** Whether audio recording is enabled for this bot */
+  audioRecordingEnabled: boolean;
+  /** Write stream for audio recording chunks */
+  audioStream?: fs.WriteStream;
+  /** Storage path for this bot's recordings */
+  storagePath?: string;
 }
 
 @Injectable()
@@ -68,8 +77,13 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     meetingKey: string;
     autoExitMinutes?: number; // 0 = disabled
     authStatePath?: string | null; // per-user auth file path (overrides global)
+    screenRecordingEnabled?: boolean;
+    audioRecordingEnabled?: boolean;
+    storagePath?: string;
   }): Promise<EventEmitter> {
     const { meetingUrl, botName, meetingKey } = options;
+    const screenRecordingEnabled = options.screenRecordingEnabled ?? true;
+    const audioRecordingEnabled = options.audioRecordingEnabled ?? true;
     const emitter = new EventEmitter();
 
     // Prevent duplicate bots for the same meeting
@@ -87,7 +101,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
       // Launch Playwright Chromium with Google Meet-optimized flags
       const browser = await chromium.launch({
-        headless: false,
+        headless: true,
         args: [
           '--no-sandbox',
           '--use-fake-ui-for-media-stream',
@@ -105,21 +119,13 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         ],
       });
 
-      // Create browser context with auth state (Google account session)
-      const contextOptions: Record<string, any> = {
-        viewport: { width: 1280, height: 720 },
-        userAgent:
-          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        permissions: ['microphone', 'camera'],
-        locale: 'en-US',
-      };
-
-      if (authPath) {
-        contextOptions.storageState = authPath;
-      }
-
-      const context = await browser.newContext(contextOptions);
+      // Create browser context with optional auth state and screen recording
+      const context = await this.createBotContext(browser, {
+        authPath,
+        screenRecordingEnabled,
+        meetingKey,
+        storagePath: options.storagePath,
+      });
       const page = await context.newPage();
 
       // Store the bot reference immediately so cleanup can find it
@@ -137,6 +143,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         lastCaptionTime: 0,
         bridgeExposed: false,
         recoveryCount: 0,
+        screenRecordingEnabled,
+        audioRecordingEnabled,
+        storagePath: options.storagePath,
       };
       this.activeBots.set(meetingKey, bot);
 
@@ -157,6 +166,44 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     }
 
     return emitter;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Browser context creation helper (reused for guest fallback)
+  // ---------------------------------------------------------------------------
+
+  private async createBotContext(
+    browser: Browser,
+    options: {
+      authPath?: string | null;
+      screenRecordingEnabled?: boolean;
+      meetingKey?: string;
+      storagePath?: string;
+    },
+  ): Promise<BrowserContext> {
+    const contextOptions: Record<string, any> = {
+      viewport: { width: 1280, height: 720 },
+      userAgent:
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      permissions: ['microphone', 'camera'],
+      locale: 'en-US',
+    };
+
+    if (options.authPath) {
+      contextOptions.storageState = options.authPath;
+    }
+
+    if (options.screenRecordingEnabled && options.meetingKey && options.storagePath) {
+      const recordingDir = getRecordingDir(options.storagePath, options.meetingKey);
+      contextOptions.recordVideo = {
+        dir: recordingDir,
+        size: { width: 1280, height: 720 },
+      };
+      this.logger.log(`Screen recording enabled → ${recordingDir}`);
+    }
+
+    return browser.newContext(contextOptions);
   }
 
   // ---------------------------------------------------------------------------
@@ -209,6 +256,11 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       await this.stopBot(meetingKey).catch(() => {});
     }, this.HARD_TIMEOUT_MS);
 
+    // Set up audio recording init script BEFORE navigation
+    if (bot.audioRecordingEnabled && bot.storagePath) {
+      await this.setupAudioRecordingInitScript(page);
+    }
+
     // Step 1: Navigate to the meeting URL
     emitter.emit('status', 'joining');
     this.logger.log(`Navigating to ${meetingUrl}`);
@@ -225,6 +277,55 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
     // Handle Google "sign in" redirect or "browser not supported" pages
     await this.handleBlockingPages(page, meetingUrl);
+
+    // ── Guest fallback: if auth failed (still on sign-in page), retry without auth ──
+    const currentUrl = page.url();
+    if (
+      (currentUrl.includes('accounts.google.com') || currentUrl.includes('/signin')) &&
+      bot.context.storageState !== undefined
+    ) {
+      this.logger.warn(
+        'Auth state appears expired/invalid. Retrying as guest user...',
+      );
+
+      // Close current context (closes all its pages)
+      await context.close().catch(() => {});
+
+      // Create new context WITHOUT storageState
+      const newContext = await this.createBotContext(bot.browser, {
+        authPath: null,
+        screenRecordingEnabled: bot.screenRecordingEnabled,
+        meetingKey,
+        storagePath: bot.storagePath,
+      });
+      const newPage = await newContext.newPage();
+
+      // Re-setup audio recording on new page
+      if (bot.audioRecordingEnabled && bot.storagePath) {
+        await this.setupAudioRecordingInitScript(newPage);
+      }
+
+      // Update bot references
+      bot.context = newContext;
+      bot.page = newPage;
+      bot.bridgeExposed = false;
+      page = newPage;
+      context = newContext;
+
+      // Re-navigate
+      this.logger.log('Re-navigating to meeting as guest...');
+      await page.goto(meetingUrl, { waitUntil: 'networkidle', timeout: 60_000 });
+      await page.waitForTimeout(5000);
+
+      // Handle blocking pages again
+      await this.handleBlockingPages(page, meetingUrl);
+      this.logger.log('Switched to guest mode successfully');
+    }
+
+    // Set up audio recording bridge function (after navigation, captures chunks)
+    if (bot.audioRecordingEnabled && bot.storagePath) {
+      await this.setupAudioRecordingBridge(page, meetingKey);
+    }
 
     // Step 2: Turn off mic and camera on the pre-join page
     await this.turnOffMediaDevices(page);
@@ -265,6 +366,141 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
     // Step 12: Monitor participant count for auto-exit when alone
     this.monitorParticipants(page, meetingKey, emitter);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Audio recording helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Inject init script that patches RTCPeerConnection to intercept incoming
+   * audio tracks and mix them into a single MediaRecorder stream.
+   * Must be called BEFORE navigating to the meeting URL.
+   */
+  private async setupAudioRecordingInitScript(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+      // Globals for audio capture
+      (window as any).__meetbot_audioContext = null;
+      (window as any).__meetbot_audioDestination = null;
+      (window as any).__meetbot_audioRecorder = null;
+      (window as any).__meetbot_audioSources = [];
+      (window as any).__meetbot_audioReady = false;
+
+      // Patch RTCPeerConnection to intercept incoming audio tracks
+      const OriginalRTC = window.RTCPeerConnection;
+
+      const PatchedRTC = function (this: RTCPeerConnection, ...args: any[]) {
+        const pc: RTCPeerConnection = new (OriginalRTC as any)(...args);
+
+        pc.addEventListener('track', (event: RTCTrackEvent) => {
+          if (event.track.kind === 'audio') {
+            try {
+              if (!(window as any).__meetbot_audioContext) {
+                (window as any).__meetbot_audioContext = new AudioContext();
+                (window as any).__meetbot_audioDestination =
+                  (window as any).__meetbot_audioContext.createMediaStreamDestination();
+              }
+
+              const stream = new MediaStream([event.track]);
+              const source = (window as any).__meetbot_audioContext.createMediaStreamSource(stream);
+              source.connect((window as any).__meetbot_audioDestination);
+              (window as any).__meetbot_audioSources.push(source);
+
+              // Start recorder if not already started
+              if (
+                !(window as any).__meetbot_audioRecorder &&
+                (window as any).__meetbot_audioDestination
+              ) {
+                try {
+                  const recorder = new MediaRecorder(
+                    (window as any).__meetbot_audioDestination.stream,
+                    { mimeType: 'audio/webm;codecs=opus' },
+                  );
+                  recorder.ondataavailable = async (e: BlobEvent) => {
+                    if (e.data.size > 0 && typeof (window as any).__meetbot_onAudioChunk === 'function') {
+                      const buffer = await e.data.arrayBuffer();
+                      const bytes = new Uint8Array(buffer);
+                      let binary = '';
+                      for (let i = 0; i < bytes.length; i++) {
+                        binary += String.fromCharCode(bytes[i]);
+                      }
+                      (window as any).__meetbot_onAudioChunk(btoa(binary));
+                    }
+                  };
+                  recorder.start(5000); // 5-second chunks
+                  (window as any).__meetbot_audioRecorder = recorder;
+                  (window as any).__meetbot_audioReady = true;
+                  console.log('[MeetBot] Audio recorder started');
+                } catch (recErr) {
+                  console.error('[MeetBot] Failed to start audio recorder:', recErr);
+                }
+              }
+            } catch (err) {
+              console.error('[MeetBot] Audio capture error:', err);
+            }
+          }
+        });
+
+        return pc;
+      } as any;
+
+      // Preserve prototype chain
+      PatchedRTC.prototype = OriginalRTC.prototype;
+      Object.setPrototypeOf(PatchedRTC, OriginalRTC);
+
+      // Copy static properties
+      for (const prop of Object.getOwnPropertyNames(OriginalRTC)) {
+        if (prop !== 'prototype' && prop !== 'length' && prop !== 'name') {
+          try {
+            Object.defineProperty(
+              PatchedRTC,
+              prop,
+              Object.getOwnPropertyDescriptor(OriginalRTC, prop) || {},
+            );
+          } catch {
+            // Some properties may not be configurable
+          }
+        }
+      }
+
+      (window as any).RTCPeerConnection = PatchedRTC;
+    });
+    this.logger.log('Audio recording init script injected');
+  }
+
+  /**
+   * Set up the bridge function that receives audio chunks from the page
+   * and writes them to a file via a WriteStream.
+   */
+  private async setupAudioRecordingBridge(
+    page: Page,
+    meetingKey: string,
+  ): Promise<void> {
+    const bot = this.activeBots.get(meetingKey);
+    if (!bot || !bot.storagePath) return;
+
+    const recordingDir = getRecordingDir(bot.storagePath, meetingKey);
+    const audioPath = path.join(recordingDir, 'audio.webm');
+    const audioStream = fs.createWriteStream(audioPath);
+    bot.audioStream = audioStream;
+
+    try {
+      await page.exposeFunction('__meetbot_onAudioChunk', (base64Chunk: string) => {
+        try {
+          const buffer = Buffer.from(base64Chunk, 'base64');
+          audioStream.write(buffer);
+        } catch {
+          // Ignore write errors
+        }
+      });
+      this.logger.log(`Audio recording bridge exposed → ${audioPath}`);
+    } catch (err: any) {
+      if (err.message?.includes('already been registered')) {
+        this.logger.debug('Audio bridge already registered');
+      } else {
+        this.logger.error(`Failed to expose audio bridge: ${err.message}`);
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1458,6 +1694,38 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     if (bot.captionHealthInterval) clearInterval(bot.captionHealthInterval);
     if (bot.hardTimeoutTimer) clearTimeout(bot.hardTimeoutTimer);
 
+    // Stop audio recorder in the page (with 3s timeout to prevent hang)
+    if (bot.audioStream) {
+      try {
+        await Promise.race([
+          bot.page.evaluate(() => {
+            if ((window as any).__meetbot_audioRecorder) {
+              (window as any).__meetbot_audioRecorder.stop();
+            }
+          }),
+          new Promise(resolve => setTimeout(resolve, 3000)),
+        ]);
+        // Wait briefly for final chunks to arrive via the bridge
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch {
+        // Page might already be closed
+      }
+      bot.audioStream.end();
+      this.logger.log(`Audio recording stream closed for ${meetingKey}`);
+    }
+
+    // Capture video reference BEFORE closing context — video.saveAs() can
+    // only succeed AFTER the page/context is closed (Playwright finalises
+    // the recording file on close). Calling saveAs before close deadlocks.
+    let videoRef: ReturnType<Page['video']> = null;
+    if (bot.screenRecordingEnabled && bot.storagePath) {
+      try {
+        videoRef = bot.page.video();
+      } catch {
+        // Page might already be closed
+      }
+    }
+
     // Try to leave the meeting gracefully
     try {
       const leaveBtn = bot.page.locator(
@@ -1479,13 +1747,36 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       // Page might already be closed
     }
 
-    // Close the browser context and browser
+    // Close browser context — this finalises the video recording file.
+    // context.close() can be slow when recording video (Playwright #4148),
+    // so enforce a 10s timeout and fall through to browser.close().
     try {
-      await bot.context.close();
+      await Promise.race([
+        bot.context.close(),
+        new Promise(resolve => setTimeout(resolve, 10_000)),
+      ]);
     } catch {
       // Ignore
     }
 
+    // Save screen recording AFTER context close (video file is now finalised)
+    if (videoRef && bot.storagePath) {
+      try {
+        const recordingDir = getRecordingDir(bot.storagePath, meetingKey);
+        const screenPath = path.join(recordingDir, 'screen.webm');
+        await Promise.race([
+          videoRef.saveAs(screenPath),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('video.saveAs timed out')), 10_000),
+          ),
+        ]);
+        this.logger.log(`Screen recording saved: ${screenPath}`);
+      } catch (err: any) {
+        this.logger.warn(`Failed to save screen recording: ${err.message}`);
+      }
+    }
+
+    // Close the browser process
     try {
       await bot.browser.close();
     } catch {

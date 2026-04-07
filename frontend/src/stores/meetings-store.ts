@@ -1,14 +1,25 @@
 import { create } from "zustand";
-import { api, type Meeting, type BotStatusItem } from "@/lib/api";
+import {
+  api,
+  type Meeting,
+  type BotStatusItem,
+  type PaginationMeta,
+} from "@/lib/api";
 
 interface MeetingsState {
   meetings: Meeting[];
+  meta: PaginationMeta | null;
   activeBots: BotStatusItem[];
   isLoading: boolean;
   error: string | null;
 
   // Actions
-  fetchMeetings: () => Promise<void>;
+  fetchMeetings: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    search?: string;
+  }) => Promise<void>;
   fetchActiveBots: () => Promise<void>;
   deleteMeeting: (platform: string, nativeMeetingId: string) => Promise<void>;
   reset: () => void;
@@ -16,15 +27,16 @@ interface MeetingsState {
 
 export const useMeetingsStore = create<MeetingsState>((set, get) => ({
   meetings: [],
+  meta: null,
   activeBots: [],
   isLoading: false,
   error: null,
 
-  fetchMeetings: async () => {
+  fetchMeetings: async (params) => {
     set({ isLoading: true, error: null });
     try {
-      const meetings = await api.listMeetings();
-      set({ meetings, isLoading: false });
+      const result = await api.listMeetings(params);
+      set({ meetings: result.meetings, meta: result.meta, isLoading: false });
     } catch (err) {
       set({
         isLoading: false,
@@ -48,15 +60,18 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
   deleteMeeting: async (platform: string, nativeMeetingId: string) => {
     await api.deleteMeeting(platform, nativeMeetingId);
     // Re-fetch from the server to get the accurate list
-    // (filtering locally by platform+nativeMeetingId is unsafe because
-    //  multiple meetings can share the same meeting code)
-    const meetings = await api.listMeetings();
-    set({ meetings });
+    const { meta } = get();
+    const result = await api.listMeetings({
+      page: meta?.page || 1,
+      limit: meta?.limit || 20,
+    });
+    set({ meetings: result.meetings, meta: result.meta });
   },
 
   reset: () => {
     set({
       meetings: [],
+      meta: null,
       activeBots: [],
       isLoading: false,
       error: null,

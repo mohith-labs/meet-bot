@@ -44,6 +44,18 @@ export interface Meeting {
   updatedAt: string;
 }
 
+export interface PaginationMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface PaginatedMeetings {
+  meetings: Meeting[];
+  meta: PaginationMeta;
+}
+
 /** Shape returned by POST /bots (createBot) */
 export interface CreateBotResponse {
   meetingId: string;
@@ -376,6 +388,8 @@ class ApiClient {
     botName?: string;
     language?: string;
     recordingEnabled?: boolean;
+    screenRecordingEnabled?: boolean;
+    audioRecordingEnabled?: boolean;
     transcribeEnabled?: boolean;
   }): Promise<CreateBotResponse> {
     return this.request<CreateBotResponse>("/bots", {
@@ -418,8 +432,19 @@ class ApiClient {
 
   // ── Meetings ────────────────────────────────────────────────────────────
 
-  async listMeetings(): Promise<Meeting[]> {
-    return this.request<Meeting[]>("/meetings");
+  async listMeetings(params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    search?: string;
+  }): Promise<PaginatedMeetings> {
+    const query = new URLSearchParams();
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.limit) query.set("limit", String(params.limit));
+    if (params?.status) query.set("status", params.status);
+    if (params?.search) query.set("search", params.search);
+    const qs = query.toString();
+    return this.request<PaginatedMeetings>(`/meetings${qs ? `?${qs}` : ""}`);
   }
 
   async getMeetingById(id: string): Promise<Meeting> {
@@ -653,6 +678,12 @@ class ApiClient {
 
   async getRegistrationStatus(): Promise<{ registrationEnabled: boolean }> {
     return this.request<{ registrationEnabled: boolean }>("/auth/registration-status");
+  }
+
+  // ── Recordings ──────────────────────────────────────────────────────────
+
+  getRecordingUrl(meetingId: string, type: "screen" | "audio"): string {
+    return `${this.baseUrl}/meetings/detail/${encodeURIComponent(meetingId)}/recording/${type}`;
   }
 }
 
