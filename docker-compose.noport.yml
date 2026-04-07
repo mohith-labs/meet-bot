@@ -3,6 +3,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    ipc: host
+    shm_size: '2gb'
     environment:
       - PORT=${PORT}
       - JWT_SECRET=${JWT_SECRET}
@@ -16,8 +18,10 @@ services:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - ADMIN_NAME=${ADMIN_NAME}
       - REGISTRATION_ENABLED=${REGISTRATION_ENABLED}
+      - STORAGE_PATH=${STORAGE_PATH:-.data/recordings}
     volumes:
       - backend-data:/app/data
+      - backend-recordings:/app/.data/recordings
 
   frontend:
     build:
@@ -32,3 +36,4 @@ services:
 
 volumes:
   backend-data:
+  backend-recordings:

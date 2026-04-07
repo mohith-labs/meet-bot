@@ -1,10 +1,18 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
+import { chromium as vanillaChromium, Browser, BrowserContext, Page } from 'playwright';
+import { chromium as stealthChromium } from 'playwright-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { EventEmitter } from 'events';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getRecordingDir } from '../config/storage.config';
+
+// Register stealth plugin once at module load (for guest mode only)
+const stealthPlugin = StealthPlugin();
+stealthPlugin.enabledEvasions.delete('iframe.contentWindow');
+stealthPlugin.enabledEvasions.delete('media.codecs');
+stealthChromium.use(stealthPlugin);
 
 export interface CaptionEvent {
   speaker: string;
@@ -51,6 +59,8 @@ interface ActiveBot {
   audioRecordingEnabled: boolean;
   /** Storage path for this bot's recordings */
   storagePath?: string;
+  /** Whether the bot is running in guest mode (no auth.json) */
+  isGuestMode: boolean;
 }
 
 @Injectable()
@@ -97,25 +107,62 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         ? options.authStatePath
         : this.resolveAuthPath();
 
-      // Launch Playwright Chromium in headless mode.
-      const browser = await chromium.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--use-fake-ui-for-media-stream',
-          '--use-fake-device-for-media-stream',
-          '--disable-gpu',
-          '--disable-dev-shm-usage',
-          '--disable-features=WebRtcHideLocalIpsWithMdns',
-          '--disable-notifications',
-          '--disable-popup-blocking',
-          '--window-size=1280,720',
-          '--autoplay-policy=no-user-gesture-required',
-          '--disable-background-timer-throttling',
-          '--disable-backgrounding-occluded-windows',
-          '--disable-renderer-backgrounding',
-        ],
-      });
+      // Two launch modes:
+      //   - Authenticated (auth.json exists): use vanilla Playwright with the
+      //     original args.  The stealth plugin + incognito flag interfere with
+      //     Google's stored session (account chooser appears, cookies stripped).
+      //   - Guest (no auth.json): use playwright-extra with the stealth plugin
+      //     so Google Meet doesn't detect automation and block the guest UI.
+      const isGuestMode = !authPath;
+
+      const sharedArgs = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--use-fake-ui-for-media-stream',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--disable-notifications',
+        '--disable-popup-blocking',
+        '--window-size=1280,720',
+        '--autoplay-policy=no-user-gesture-required',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+      ];
+
+      let browser: Browser;
+
+      if (isGuestMode) {
+        // Guest mode: stealth plugin + aggressive anti-detection args
+        this.logger.log('Launching browser in GUEST mode (stealth enabled)');
+        browser = await stealthChromium.launch({
+          headless: false,
+          args: [
+            ...sharedArgs,
+            '--incognito',
+            '--disable-features=IsolateOrigins,site-per-process,VizDisplayCompositor',
+            '--disable-infobars',
+            '--use-file-for-fake-video-capture=/dev/null',
+            '--use-file-for-fake-audio-capture=/dev/null',
+            '--allow-running-insecure-content',
+            '--disable-web-security',
+            '--disable-site-isolation-trials',
+            '--ignore-certificate-errors',
+            '--ignore-ssl-errors',
+            '--ignore-certificate-errors-spki-list',
+          ],
+        });
+      } else {
+        // Authenticated mode: vanilla Playwright, no stealth (preserves session cookies)
+        this.logger.log('Launching browser in AUTH mode (auth.json detected)');
+        browser = await vanillaChromium.launch({
+          headless: false,
+          args: [
+            ...sharedArgs,
+            '--disable-features=WebRtcHideLocalIpsWithMdns',
+          ],
+        });
+      }
 
       // Create browser context with optional auth state and screen recording
       const context = await this.createBotContext(browser, {
@@ -144,6 +191,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         screenRecordingEnabled,
         audioRecordingEnabled,
         storagePath: options.storagePath,
+        isGuestMode,
       };
       this.activeBots.set(meetingKey, bot);
 
@@ -182,11 +230,11 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     const contextOptions: Record<string, any> = {
       viewport: { width: 1280, height: 720 },
       userAgent:
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      permissions: ['microphone', 'camera'],
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+      permissions: ['camera', 'microphone'],
       locale: 'en-US',
-      acceptDownloads: true,  // Required for audio recording save via download API
+      acceptDownloads: true,
     };
 
     if (options.authPath) {
@@ -260,6 +308,24 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       await this.setupAudioRecordingInitScript(page);
     }
 
+    // Anti-detection init scripts — only for guest mode.
+    // In auth mode, these interfere with Google's session handling.
+    if (bot.isGuestMode) {
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }],
+        });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        Object.defineProperty(window, 'innerWidth', { get: () => 1920 });
+        Object.defineProperty(window, 'innerHeight', { get: () => 1080 });
+        Object.defineProperty(window, 'outerWidth', { get: () => 1920 });
+        Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
+      });
+    }
+
     // Step 1: Navigate to the meeting URL
     emitter.emit('status', 'joining');
     this.logger.log(`Navigating to ${meetingUrl}`);
@@ -279,12 +345,14 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
     // ── Guest fallback: if auth failed (still on sign-in page), retry without auth ──
     const currentUrl = page.url();
-    if (
-      (currentUrl.includes('accounts.google.com') || currentUrl.includes('/signin')) &&
-      bot.context.storageState !== undefined
-    ) {
+    const isOnSignIn =
+      currentUrl.includes('accounts.google.com') ||
+      currentUrl.includes('/signin') ||
+      currentUrl.includes('/ServiceLogin');
+
+    if (isOnSignIn) {
       this.logger.warn(
-        'Auth state appears expired/invalid. Retrying as guest user...',
+        'Redirected to Google sign-in. Retrying as guest user without auth...',
       );
 
       // Close current context (closes all its pages)
@@ -304,10 +372,11 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         await this.setupAudioRecordingInitScript(newPage);
       }
 
-      // Update bot references
+      // Update bot references — now in guest mode
       bot.context = newContext;
       bot.page = newPage;
       bot.bridgeExposed = false;
+      bot.isGuestMode = true;
       page = newPage;
       context = newContext;
 
@@ -597,16 +666,24 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       await page.waitForTimeout(3000);
     }
 
-    // "You can't join this video call" or "Check your meeting code"
+    // Check for truly inaccessible meetings (invalid code, etc.)
+    // IMPORTANT: "You can't join" does NOT always mean failure — Google Meet
+    // shows this text to unauthenticated users alongside a name input and
+    // "Ask to join" button.  Only throw if there's no way to proceed.
     const lowerBody = bodyText.toLowerCase();
     if (
-      lowerBody.includes("can't join") ||
       lowerBody.includes('check your meeting code') ||
       lowerBody.includes('meeting not found') ||
       lowerBody.includes('invalid meeting')
     ) {
       throw new Error(`Meeting not accessible: ${bodyText.substring(0, 100)}`);
     }
+
+    // NOTE: "You can't join this video call" is a TRANSIENT splash that
+    // Google Meet shows briefly before rendering the guest pre-join screen
+    // (name input + "Ask to join" button).  Do NOT throw here — the guest
+    // UI will appear after a few seconds.  The actual join/name-fill step
+    // uses waitForSelector with a long timeout to handle this transition.
 
     // "Your browser doesn't support" or "Switch to Chrome"
     if (
@@ -681,43 +758,113 @@ export class GoogleMeetBotService implements OnModuleDestroy {
   // ---------------------------------------------------------------------------
 
   private async fillNameIfGuest(page: Page, botName: string): Promise<void> {
-    // Ordered by specificity
     const nameSelectors = [
+      'input[type="text"][aria-label="Your name"]',
       'input[aria-label="Your name"]',
       'input[placeholder="Your name"]',
+      'input[placeholder*="name" i]',
+      'input[aria-label="Enter your name"]',
+      'input[data-placeholder="Your name"]',
       'input[type="text"][jsname]',
-      '#c7',
     ];
+    const combinedSelector = nameSelectors.join(', ');
 
-    for (const selector of nameSelectors) {
+    // ── Quick check (3s): detect if we're in guest mode or auth session ──
+    // Authenticated sessions (auth.json) land on the pre-join screen with
+    // mic/camera toggles and a "Join now" button — no name input at all.
+    // Guest sessions either show a name input immediately or show a
+    // "You can't join" splash first.
+    let nameInput: any = null;
+    try {
+      nameInput = await page.waitForSelector(combinedSelector, {
+        state: 'visible',
+        timeout: 3_000,
+      });
+    } catch {
+      // Not found in 3s — check page text to decide next step
+    }
+
+    // Name input found immediately → fill and return
+    if (nameInput) {
+      await nameInput.click();
+      await nameInput.fill('');
+      await nameInput.fill(botName);
+      this.logger.log(`Entered bot name: ${botName}`);
+      return;
+    }
+
+    // Check page text to decide if this is an auth session or guest mode
+    const bodyText = await page.evaluate(() =>
+      (document.body?.innerText || '').substring(0, 500).toLowerCase(),
+    ).catch(() => '');
+
+    // No name input AND no "can't join" → authenticated session, skip
+    if (!bodyText.includes("can't join")) {
+      this.logger.debug('No name input found — authenticated session, skipping guest flow');
+      return;
+    }
+
+    // ── Guest retry loop: "can't join" is showing, host may not be present ──
+    // Refresh periodically so we pick up the meeting when the host joins.
+    const meetingUrl = page.url();
+    const MAX_RETRIES = 4;
+    const WAIT_PER_RETRY = 30_000;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const input = page.locator(selector).first();
-        if ((await input.count()) > 0 && (await input.isVisible())) {
-          await input.click();
-          await input.fill(botName);
+        this.logger.log(
+          `Guest mode: waiting for name input (attempt ${attempt}/${MAX_RETRIES}, ${WAIT_PER_RETRY / 1000}s)...`,
+        );
+        nameInput = await page.waitForSelector(combinedSelector, {
+          state: 'visible',
+          timeout: WAIT_PER_RETRY,
+        });
+
+        if (nameInput) {
+          await nameInput.click();
+          await nameInput.fill('');
+          await nameInput.fill(botName);
           this.logger.log(`Entered bot name: ${botName}`);
           return;
         }
       } catch {
+        // Timeout — name input didn't appear in this cycle
+      }
+
+      // Re-check page state
+      const currentText = await page.evaluate(() =>
+        (document.body?.innerText || '').substring(0, 500).toLowerCase(),
+      ).catch(() => '');
+
+      // Terminal errors — don't retry
+      if (
+        currentText.includes('check your meeting code') ||
+        currentText.includes('meeting not found') ||
+        currentText.includes('invalid meeting')
+      ) {
+        throw new Error(
+          'Meeting not accessible: the meeting code is invalid or the meeting no longer exists.',
+        );
+      }
+
+      // Refresh and retry if host still not present
+      if (currentText.includes("can't join") && attempt < MAX_RETRIES) {
+        this.logger.log(
+          `Host may not be present yet. Refreshing... (${attempt}/${MAX_RETRIES})`,
+        );
+        await page.goto(meetingUrl, { waitUntil: 'networkidle', timeout: 30_000 });
+        await page.waitForTimeout(3000);
         continue;
       }
     }
 
-    // Fallback: find any visible text input
-    try {
-      const inputs = page.locator('input[type="text"]');
-      const count = await inputs.count();
-      for (let i = 0; i < count; i++) {
-        const input = inputs.nth(i);
-        if (await input.isVisible()) {
-          await input.fill(botName);
-          this.logger.log(`Entered bot name via fallback: ${botName}`);
-          return;
-        }
-      }
-    } catch {
-      // No name input found — likely authenticated via auth.json
-    }
+    // All retries exhausted
+    throw new Error(
+      'Could not join meeting as guest after multiple retries. ' +
+      'The host may not have started the meeting, the meeting code may be invalid, ' +
+      'or guest access is not allowed. ' +
+      'Upload auth.json in Settings → Bot Authentication, or ask the host to allow guest access.',
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -727,8 +874,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
   private async clickJoinButton(page: Page): Promise<void> {
     const joinTexts = [
       'Continue without microphone and camera',
-      'Join now',
       'Ask to join',
+      'Request to join',
+      'Join now',
       'Join meeting',
       'Join call',
       'Join',
@@ -906,12 +1054,14 @@ export class GoogleMeetBotService implements OnModuleDestroy {
           return;
         }
 
-        // Check if entry was denied
+        // Check if entry was denied — but not "You can't join" since that
+        // text remains visible on the guest waiting-for-admission screen
         if (
-          lowerText.includes("you can't join") ||
           lowerText.includes('denied') ||
           lowerText.includes('meeting has ended') ||
-          lowerText.includes('not allowed')
+          lowerText.includes('not allowed') ||
+          lowerText.includes('removed from the meeting') ||
+          lowerText.includes('you were removed')
         ) {
           throw new Error('Bot was denied entry to the meeting');
         }
