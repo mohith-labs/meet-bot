@@ -352,6 +352,27 @@ export class BotsService {
   // Meeting ended
   // ---------------------------------------------------------------------------
 
+  /**
+   * Build recording download URLs for webhook payloads.
+   * Uses API_BASE_URL env var to construct full URLs.
+   */
+  private getRecordingUrls(meetingId: string): {
+    screenRecordingUrl: string;
+    audioRecordingUrl: string;
+  } {
+    const port = this.configService.get<number>('PORT', 3001);
+    const baseUrl = this.configService.get<string>(
+      'API_BASE_URL',
+      `http://localhost:${port}`,
+    );
+    const base = baseUrl.replace(/\/+$/, '');
+
+    return {
+      screenRecordingUrl: `${base}/meetings/detail/${meetingId}/recording/screen`,
+      audioRecordingUrl: `${base}/meetings/detail/${meetingId}/recording/audio`,
+    };
+  }
+
   private async handleMeetingEnded(
     meetingId: string,
     meetingKey: string,
@@ -374,6 +395,7 @@ export class BotsService {
       });
 
       if (meeting) {
+        const recordingUrls = this.getRecordingUrls(meeting.id);
         this.webhookDispatcher.dispatch(meeting.userId, 'meeting.ended', {
           meetingId: meeting.id,
           platform: meeting.platform,
@@ -392,6 +414,10 @@ export class BotsService {
               startTime: s.startTime,
               endTime: s.endTime,
             })),
+          },
+          recordings: {
+            screenRecordingUrl: recordingUrls.screenRecordingUrl,
+            audioRecordingUrl: recordingUrls.audioRecordingUrl,
           },
         });
       }
@@ -458,31 +484,10 @@ export class BotsService {
     // Save all accumulated transcript segments (final flush)
     await this.saveBufferedTranscripts(meeting.id);
 
-    // Dispatch meeting.ended webhook with transcript data
+    // Fetch transcript segments for the webhook payload
     const segments = await this.transcriptSegmentsRepository.find({
       where: { meetingId: meeting.id },
       order: { startTime: 'ASC' },
-    });
-
-    this.webhookDispatcher.dispatch(meeting.userId, 'meeting.ended', {
-      meetingId: meeting.id,
-      platform: meeting.platform,
-      nativeMeetingId: meeting.nativeMeetingId,
-      meetingUrl: meeting.constructedMeetingUrl,
-      botName: meeting.data?.botName || 'MeetBot',
-      status: 'completed',
-      startTime: meeting.startTime?.toISOString(),
-      endTime: new Date().toISOString(),
-      transcript: {
-        totalSegments: segments.length,
-        fullText: segments.map(s => s.text).join(' '),
-        segments: segments.map(s => ({
-          speaker: s.speaker,
-          text: s.text,
-          startTime: s.startTime,
-          endTime: s.endTime,
-        })),
-      },
     });
 
     // NOW stop the Playwright browser (safe — captions already saved)
@@ -507,6 +512,37 @@ export class BotsService {
     if (fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0) {
       recordingUpdates.audioRecordingPath = audioPath;
     }
+
+    // Dispatch meeting.ended webhook AFTER recordings are saved
+    const recordingUrls = this.getRecordingUrls(meeting.id);
+    this.webhookDispatcher.dispatch(meeting.userId, 'meeting.ended', {
+      meetingId: meeting.id,
+      platform: meeting.platform,
+      nativeMeetingId: meeting.nativeMeetingId,
+      meetingUrl: meeting.constructedMeetingUrl,
+      botName: meeting.data?.botName || 'MeetBot',
+      status: 'completed',
+      startTime: meeting.startTime?.toISOString(),
+      endTime: new Date().toISOString(),
+      transcript: {
+        totalSegments: segments.length,
+        fullText: segments.map(s => s.text).join(' '),
+        segments: segments.map(s => ({
+          speaker: s.speaker,
+          text: s.text,
+          startTime: s.startTime,
+          endTime: s.endTime,
+        })),
+      },
+      recordings: {
+        screenRecordingUrl: recordingUpdates.screenRecordingPath
+          ? recordingUrls.screenRecordingUrl
+          : null,
+        audioRecordingUrl: recordingUpdates.audioRecordingPath
+          ? recordingUrls.audioRecordingUrl
+          : null,
+      },
+    });
 
     // Mark as completed and save recording paths
     meeting.status = MeetingStatus.COMPLETED;
