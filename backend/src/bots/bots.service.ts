@@ -353,23 +353,15 @@ export class BotsService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Build recording download URLs for webhook payloads.
-   * Uses API_BASE_URL env var to construct full URLs.
+   * Build recording download paths for webhook payloads.
    */
   private getRecordingUrls(meetingId: string): {
     screenRecordingUrl: string;
     audioRecordingUrl: string;
   } {
-    const port = this.configService.get<number>('PORT', 3001);
-    const baseUrl = this.configService.get<string>(
-      'API_BASE_URL',
-      `http://localhost:${port}`,
-    );
-    const base = baseUrl.replace(/\/+$/, '');
-
     return {
-      screenRecordingUrl: `${base}/meetings/detail/${meetingId}/recording/screen`,
-      audioRecordingUrl: `${base}/meetings/detail/${meetingId}/recording/audio`,
+      screenRecordingUrl: `/meetings/detail/${meetingId}/recording/screen`,
+      audioRecordingUrl: `/meetings/detail/${meetingId}/recording/audio`,
     };
   }
 
