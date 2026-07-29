@@ -17,7 +17,8 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:e2e": "jest --config ./test/jest-e2e.json",
-    "gen:auth": "node scripts/generate-auth.js"
+    "gen:auth": "node scripts/generate-auth.js",
+    "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
     "@nestjs/common": "^10.3.0",

@@ -1109,7 +1109,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
       // Check if captions region appeared
       const captionRegion = page.locator(
-        '[role="region"][aria-label*="Captions" i]',
+        '[role="region"][aria-label*="aption" i], [role="region"][aria-label*="ubtitle" i]',
       );
       try {
         await captionRegion.waitFor({ timeout: 800 });
@@ -1124,7 +1124,9 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       }
 
       // Also check if "Turn off captions" button is visible (means captions are ON)
-      const ccOffBtn = page.locator('button[aria-label*="Turn off captions" i]');
+      const ccOffBtn = page.locator(
+        'button[aria-label*="Turn off captions" i], button[aria-label*="Turn off subtitle" i], button[aria-label*="Disable captions" i]',
+      );
       if (await ccOffBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
         this.logger.log(
           'Captions confirmed ON (Turn off captions button visible)',
@@ -1142,13 +1144,15 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     await page.mouse.move(500, 700);
     await page.waitForTimeout(300);
 
-    const ccButton = page.locator('button[aria-label*="Turn on captions" i]');
+    const ccButton = page.locator(
+      'button[aria-label*="Turn on captions" i], button[aria-label*="Enable captions" i], button[aria-label*="Turn on subtitle" i], button[aria-label*="closed caption" i]',
+    );
     try {
       await ccButton.waitFor({ state: 'visible', timeout: 4000 });
       await ccButton.click();
       // Verify captions turned on
       const captionRegion = page.locator(
-        '[role="region"][aria-label*="Captions" i]',
+        '[role="region"][aria-label*="aption" i], [role="region"][aria-label*="ubtitle" i]',
       );
       if (
         await captionRegion
@@ -1200,19 +1204,31 @@ export class GoogleMeetBotService implements OnModuleDestroy {
     // We MUST wait for this exact element and observe ONLY inside it.
     // -------------------------------------------------------------------------
 
-    // Step 1: Wait for the specific Captions region
+    // Step 1: Wait for the specific Captions region (try multiple selectors)
     this.logger.log('Waiting for Captions region to appear...');
     try {
       await page.waitForSelector(
-        '[role="region"][aria-label*="aption" i]',
+        '[role="region"][aria-label*="aption" i], [role="region"][aria-label*="ubtitle" i]',
         { timeout: 60_000 },
       );
       this.logger.log('Captions region found!');
     } catch {
       this.logger.warn(
-        'Could not find Captions region. Captions may not be enabled.',
+        'Could not find Captions region with primary selectors. Trying fallback...',
       );
-      return;
+      // Fallback: look for any aria-live polite region that appeared after captions were enabled
+      try {
+        await page.waitForSelector(
+          '[aria-live="polite"][role="region"]',
+          { timeout: 10_000 },
+        );
+        this.logger.log('Captions region found via fallback selector!');
+      } catch {
+        this.logger.warn(
+          'Could not find Captions region. Captions may not be enabled.',
+        );
+        return;
+      }
     }
 
     // System phrases to filter out (Google Meet accessibility announcements)
@@ -1506,30 +1522,61 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         }
         (window as any).__meetbot_observerAttached = false;
 
-        // Find the EXACT captions region — NOT the generic [aria-live] status areas
-        const captionsRegion = document.querySelector<HTMLElement>(
+        // Find the captions region — try multiple selectors for robustness
+        const CAPTION_REGION_SELECTORS = [
           '[role="region"][aria-label*="aption" i]',
-        );
-        if (!captionsRegion) {
-          console.error('[MeetBot] Captions region not found for (re-)attach');
-          return false;
+          '[role="region"][aria-label*="ubtitle" i]',
+          '[role="region"][aria-label*="closed caption" i]',
+          '[aria-live="polite"][role="region"]',
+        ];
+
+        let captionsRegion: HTMLElement | null = null;
+        for (const sel of CAPTION_REGION_SELECTORS) {
+          captionsRegion = document.querySelector<HTMLElement>(sel);
+          if (captionsRegion && captionsRegion.isConnected) {
+            console.log(`[MeetBot] Captions region found via: ${sel}`);
+            break;
+          }
+          captionsRegion = null;
         }
 
-        // Verify the region is still connected to the live DOM
-        if (!captionsRegion.isConnected) {
-          console.error('[MeetBot] Captions region found but not connected to DOM');
+        if (!captionsRegion) {
+          console.error('[MeetBot] Captions region not found with any selector');
           return false;
         }
 
         console.log(
           '[MeetBot] (Re-)attaching observer to captions region:',
           captionsRegion.getAttribute('aria-label'),
+          'outerHTML preview:', captionsRegion.outerHTML.substring(0, 200),
         );
 
         let lastSpeaker = '';
         let lastText = '';
 
-        // Extract speaker + text from a caption entry node.
+        // ── Robust speaker + text extraction from a caption entry node ──
+        // Google Meet's caption DOM structure varies across versions:
+        //
+        //   Version A (classic):
+        //     <div class="entry">
+        //       <img alt="Speaker Name" />
+        //       <div class="name">Speaker Name</div>
+        //       <div class="text">Caption text here</div>
+        //     </div>
+        //
+        //   Version B (2024+):
+        //     <div class="entry">
+        //       <div>Speaker Name</div>
+        //       <div>Caption text here and more text</div>
+        //     </div>
+        //
+        //   Version C (2025+, flat spans):
+        //     <div class="entry">
+        //       <span>Speaker Name</span>
+        //       <span>Caption text here</span>
+        //     </div>
+        //
+        // The extraction uses a layered approach with multiple strategies.
         const extractFromNode = (
           node: HTMLElement,
         ): { speaker: string; text: string } | null => {
@@ -1537,51 +1584,110 @@ export class GoogleMeetBotService implements OnModuleDestroy {
           if (!fullText || fullText.length < 2) return null;
 
           let speaker = '';
-          let captionText = fullText;
+          let captionText = '';
 
-          // Strategy 1: Look for an img with alt text (avatar)
+          // Strategy 1: Look for an <img> with alt text (avatar = speaker name)
           const img = node.querySelector('img');
-          if (img && img.alt) {
+          if (img && img.alt && img.alt.trim().length > 0) {
             speaker = img.alt.trim();
           }
 
-          // Strategy 2: Look at direct child elements
-          const directChildren = Array.from(node.children) as HTMLElement[];
-          if (directChildren.length >= 2) {
-            for (const child of directChildren) {
-              const ct = child.textContent?.trim() || '';
-              if (
-                ct.length > 0 &&
-                ct.length < 40 &&
-                ct.length < fullText.length * 0.5
-              ) {
-                speaker = ct;
-                captionText = fullText.replace(ct, '').trim();
-                break;
+          // Strategy 2: Structural extraction — find the last substantial
+          // text-bearing leaf node (= caption text) and the first short one (= speaker).
+          // This works regardless of nesting depth because we collect all
+          // leaf text nodes and group them.
+          const textNodes: { el: HTMLElement; text: string }[] = [];
+          const walk = (el: HTMLElement) => {
+            // If this element has no child elements, it's a leaf
+            if (el.children.length === 0) {
+              const t = el.textContent?.trim() || '';
+              if (t.length > 0) {
+                textNodes.push({ el, text: t });
+              }
+            } else {
+              for (const child of Array.from(el.children) as HTMLElement[]) {
+                walk(child);
+              }
+            }
+          };
+          walk(node);
+
+          if (textNodes.length >= 2) {
+            // In Google Meet captions, the speaker name is typically the
+            // FIRST leaf and is short. The caption text spans the remaining
+            // leaf nodes joined together.
+            const firstNode = textNodes[0];
+            const remainingText = textNodes
+              .slice(1)
+              .map((n) => n.text)
+              .join(' ')
+              .trim();
+
+            // The first node is the speaker if it's reasonably short
+            // and the remaining text is longer
+            if (
+              firstNode.text.length < 60 &&
+              remainingText.length > 0 &&
+              (firstNode.text.length < remainingText.length ||
+                textNodes.length === 2)
+            ) {
+              if (!speaker) speaker = firstNode.text;
+              captionText = remainingText;
+            }
+          }
+
+          // Strategy 3: Direct children split — the classic 2-child layout
+          // where child[0] is the speaker and child[1] is the text.
+          if (!captionText) {
+            const directChildren = Array.from(node.children) as HTMLElement[];
+            if (directChildren.length >= 2) {
+              const first = directChildren[0]?.textContent?.trim() || '';
+              const rest = directChildren
+                .slice(1)
+                .map((c) => c.textContent?.trim() || '')
+                .join(' ')
+                .trim();
+
+              if (first.length > 0 && first.length < 60 && rest.length > 0) {
+                if (!speaker) speaker = first;
+                captionText = rest;
               }
             }
           }
 
-          // If speaker is still empty, walk deeper
-          if (!speaker) {
-            const allSpans = node.querySelectorAll<HTMLElement>('span, div');
-            for (const span of allSpans) {
-              const st = span.textContent?.trim() || '';
-              if (
-                st.length > 0 &&
-                st.length < 40 &&
-                st !== fullText &&
-                st.length < fullText.length * 0.5
-              ) {
-                speaker = st;
-                captionText = fullText.replace(st, '').trim();
-                break;
-              }
+          // Strategy 4: Single-child or flat text — the entire node text
+          // IS the caption. Use the last known speaker.
+          if (!captionText) {
+            captionText = fullText;
+          }
+
+          // Clean up: remove the speaker name from the start of captionText
+          // if it got included (happens when both speaker and text are
+          // concatenated in fullText).
+          if (speaker && captionText.startsWith(speaker)) {
+            captionText = captionText.substring(speaker.length).trim();
+          }
+
+          if (!captionText || captionText.length < 1) {
+            // If we still have no caption text but have full text, use it all
+            if (fullText.length >= 2) {
+              captionText = fullText;
+            } else {
+              return null;
             }
           }
 
-          if (!captionText || captionText.length < 1) return null;
-          return { speaker: speaker || lastSpeaker, text: captionText };
+          const finalSpeaker = speaker || lastSpeaker || 'Unknown';
+
+          // Debug log (throttled — only log when content changes)
+          if (captionText !== lastText || finalSpeaker !== lastSpeaker) {
+            console.log(
+              `[MeetBot] Extracted — speaker: "${finalSpeaker}", text: "${captionText.substring(0, 80)}..."`,
+              `(strategies: img=${!!img?.alt}, leaves=${textNodes.length}, children=${node.children.length})`,
+            );
+          }
+
+          return { speaker: finalSpeaker, text: captionText };
         };
 
         const send = (node: HTMLElement): void => {
@@ -1594,7 +1700,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
           try {
             (window as any).__meetbot_onCaption(result.speaker, result.text);
           } catch {
-            /* not yet available */
+            /* bridge not yet available */
           }
         };
 
