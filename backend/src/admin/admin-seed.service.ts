@@ -83,7 +83,7 @@ export class AdminSeedService implements OnModuleInit {
       );
     }
 
-    // Seed recording retention days (default: 30 days, 0 = keep forever)
+    // Seed recording retention days (default: 7 days, 0 = keep forever)
     const retentionKey = 'recording_retention_days';
     const existingRetention = await this.appSettingsRepository.findOne({
       where: { key: retentionKey },
@@ -92,9 +92,9 @@ export class AdminSeedService implements OnModuleInit {
     if (!existingRetention) {
       await this.appSettingsRepository.save({
         key: retentionKey,
-        value: '30',
+        value: '7',
       });
-      this.logger.log(`Seeded app setting: ${retentionKey} = 30`);
+      this.logger.log(`Seeded app setting: ${retentionKey} = 7`);
     }
   }
 }

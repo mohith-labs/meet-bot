@@ -1,11 +1,12 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, LessThan } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import * as path from 'path';
 import * as fs from 'fs';
 import { AppSettings } from '../entities/app-settings.entity';
-import { Meeting } from '../entities/meeting.entity';
+import { Meeting, MeetingStatus } from '../entities/meeting.entity';
+import { TranscriptSegment } from '../entities/transcript-segment.entity';
 import { resolveStoragePath } from '../config/storage.config';
 
 @Injectable()
@@ -17,6 +18,8 @@ export class RecordingCleanupService implements OnModuleInit {
     private readonly appSettingsRepository: Repository<AppSettings>,
     @InjectRepository(Meeting)
     private readonly meetingsRepository: Repository<Meeting>,
+    @InjectRepository(TranscriptSegment)
+    private readonly transcriptSegmentsRepository: Repository<TranscriptSegment>,
     private readonly configService: ConfigService,
   ) {}
 
@@ -32,30 +35,41 @@ export class RecordingCleanupService implements OnModuleInit {
       const setting = await this.appSettingsRepository.findOne({
         where: { key: 'recording_retention_days' },
       });
-      const retentionDays = parseInt(setting?.value || '30', 10);
+      const retentionDays = parseInt(setting?.value || '7', 10);
       if (retentionDays <= 0) {
-        this.logger.debug('Recording retention is 0 (keep forever) — skipping cleanup');
+        this.logger.debug('Retention is 0 (keep forever) — skipping cleanup');
         return;
       }
 
       const cutoffDate = new Date();
       cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
 
+      this.logger.log(
+        `Running cleanup: deleting data older than ${retentionDays} days (before ${cutoffDate.toISOString()})`,
+      );
+
       const storagePath = resolveStoragePath(this.configService);
 
-      // Find completed meetings older than the cutoff that still have recording paths
+      // Find all completed/failed meetings older than the cutoff
       const meetings = await this.meetingsRepository
         .createQueryBuilder('meeting')
         .where('meeting.endTime < :cutoff', { cutoff: cutoffDate.toISOString() })
-        .andWhere(
-          "(meeting.data LIKE '%screenRecordingPath%' OR meeting.data LIKE '%audioRecordingPath%')",
-        )
+        .andWhere('meeting.status IN (:...statuses)', {
+          statuses: [MeetingStatus.COMPLETED, MeetingStatus.FAILED],
+        })
         .getMany();
 
-      if (meetings.length === 0) return;
+      if (meetings.length === 0) {
+        this.logger.debug('No old meetings to clean up');
+        return;
+      }
 
       let deletedFiles = 0;
+      let deletedMeetings = 0;
+      let deletedSegments = 0;
+
       for (const meeting of meetings) {
+        // 1. Delete recording files from disk
         const filePaths = [
           meeting.data?.screenRecordingPath,
           meeting.data?.audioRecordingPath,
@@ -72,33 +86,44 @@ export class RecordingCleanupService implements OnModuleInit {
           }
         }
 
-        // Clean up the meeting's recording directory if empty
+        // 2. Clean up the meeting's recording directory
         const meetingDir = path.join(storagePath, meeting.id);
         try {
           if (fs.existsSync(meetingDir)) {
-            const remaining = fs.readdirSync(meetingDir);
-            if (remaining.length === 0) {
-              fs.rmdirSync(meetingDir);
+            // Remove all files in the directory (in case there are temp files)
+            const files = fs.readdirSync(meetingDir);
+            for (const file of files) {
+              try {
+                fs.unlinkSync(path.join(meetingDir, file));
+                deletedFiles++;
+              } catch {
+                // Ignore individual file errors
+              }
             }
+            fs.rmdirSync(meetingDir);
           }
         } catch {
           // Ignore directory cleanup errors
         }
 
-        // Remove recording paths from meeting data
-        const updatedData = { ...meeting.data };
-        delete updatedData.screenRecordingPath;
-        delete updatedData.audioRecordingPath;
-        await this.meetingsRepository.update(meeting.id, { data: updatedData });
+        // 3. Delete transcript segments for this meeting
+        const segmentResult = await this.transcriptSegmentsRepository.delete({
+          meetingId: meeting.id,
+        });
+        deletedSegments += segmentResult.affected || 0;
+
+        // 4. Delete the meeting row itself
+        await this.meetingsRepository.remove(meeting);
+        deletedMeetings++;
       }
 
-      if (deletedFiles > 0) {
-        this.logger.log(
-          `Recording cleanup: deleted ${deletedFiles} file(s) from ${meetings.length} meeting(s) older than ${retentionDays} days`,
-        );
-      }
+      this.logger.log(
+        `Cleanup complete: deleted ${deletedMeetings} meeting(s), ` +
+        `${deletedSegments} transcript segment(s), ` +
+        `${deletedFiles} file(s) older than ${retentionDays} days`,
+      );
     } catch (error: any) {
-      this.logger.error(`Recording cleanup failed: ${error.message}`);
+      this.logger.error(`Cleanup failed: ${error.message}`);
     }
   }
 }
