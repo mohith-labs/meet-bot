@@ -116,6 +116,7 @@ export default function SettingsPage() {
   const [isLoadingBotAuth, setIsLoadingBotAuth] = useState(true);
   const [isUploadingAuth, setIsUploadingAuth] = useState(false);
   const [isDeletingAuth, setIsDeletingAuth] = useState(false);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(false);
   const [oauthConfigured, setOauthConfigured] = useState(false);
   const [isLoadingOAuthUrl, setIsLoadingOAuthUrl] = useState(false);
   const [showAuthPasteModal, setShowAuthPasteModal] = useState(false);
@@ -370,6 +371,25 @@ export default function SettingsPage() {
       toast.error(err.message || "Failed to upload auth content");
     } finally {
       setIsUploadingAuth(false);
+    }
+  };
+
+  const handleCheckAuthSession = async () => {
+    setIsCheckingAuth(true);
+    try {
+      const result = await api.checkBotAuthSession();
+      setBotAuthStatus(result.status);
+      if (result.status.sessionStatus === "valid") {
+        toast.success(result.message);
+      } else {
+        toast.error(result.message);
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to verify session",
+      );
+    } finally {
+      setIsCheckingAuth(false);
     }
   };
 
@@ -1082,6 +1102,25 @@ export default function SettingsPage() {
                         Updated: {formatRelativeTime(botAuthStatus.lastUpdated)}
                       </span>
                     )}
+                    {botAuthStatus.method !== "oauth" && (
+                      <Badge
+                        variant={
+                          botAuthStatus.sessionStatus === "valid"
+                            ? "success"
+                            : botAuthStatus.sessionStatus === "expired"
+                              ? "error"
+                              : "neutral"
+                        }
+                      >
+                        {botAuthStatus.sessionStatus === "valid"
+                          ? "Session valid"
+                          : botAuthStatus.sessionStatus === "expired"
+                            ? "Session expired"
+                            : "Session unverified"}
+                        {botAuthStatus.sessionCheckedAt &&
+                          ` · ${formatRelativeTime(botAuthStatus.sessionCheckedAt)}`}
+                      </Badge>
+                    )}
                   </div>
                 ) : (
                   <p className="text-xs text-text-secondary mt-0.5">
@@ -1090,6 +1129,18 @@ export default function SettingsPage() {
                   </p>
                 )}
               </div>
+              {botAuthStatus?.isConfigured &&
+                botAuthStatus.method !== "oauth" && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleCheckAuthSession}
+                    isLoading={isCheckingAuth}
+                    className="flex-shrink-0"
+                  >
+                    Verify session
+                  </Button>
+                )}
               {botAuthStatus?.isConfigured &&
                 botAuthStatus.method !== "global" && (
                   <Button
