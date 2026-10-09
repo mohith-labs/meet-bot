@@ -7,6 +7,7 @@ import { EventEmitter } from 'events';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getRecordingDir } from '../config/storage.config';
+import { BotAuthService } from '../settings/bot-auth.service';
 
 // Register stealth plugin once at module load (for guest mode only)
 const stealthPlugin = StealthPlugin();
@@ -62,6 +63,8 @@ interface ActiveBot {
   storagePath?: string;
   /** Whether the bot is running in guest mode (no auth.json) */
   isGuestMode: boolean;
+  /** Auth file this bot's context was seeded from (null in guest mode) */
+  authPath: string | null;
 }
 
 @Injectable()
@@ -74,7 +77,10 @@ export class GoogleMeetBotService implements OnModuleDestroy {
   /** Hard timeout for meetings: 4 hours (previously 100 min, too short for long meetings) */
   private readonly HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 
-  constructor(private configService: ConfigService) {}
+  constructor(
+    private configService: ConfigService,
+    private botAuthService: BotAuthService,
+  ) {}
 
   /**
    * Launch a bot that joins a Google Meet meeting.
@@ -193,6 +199,7 @@ export class GoogleMeetBotService implements OnModuleDestroy {
         audioRecordingEnabled,
         storagePath: options.storagePath,
         isGuestMode,
+        authPath: authPath || null,
       };
       this.activeBots.set(meetingKey, bot);
 
@@ -355,6 +362,11 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       this.logger.warn(
         'Redirected to Google sign-in. Retrying as guest user without auth...',
       );
+
+      // Flag the stored session so Settings shows it as expired.
+      if (bot.authPath) {
+        this.botAuthService.markSessionStatus(bot.authPath, 'expired');
+      }
 
       // Close current context (closes all its pages)
       await context.close().catch(() => {});
@@ -2140,6 +2152,10 @@ export class GoogleMeetBotService implements OnModuleDestroy {
       // Page might already be closed
     }
 
+    // Persist Google's rotated session cookies back to the auth file so the
+    // saved session stays fresh. Must happen before the context is closed.
+    await this.writeBackAuthState(bot);
+
     // Close browser context — this finalises the video recording file.
     // context.close() can be slow when recording video (Playwright #4148),
     // so enforce a 10s timeout and fall through to browser.close().
@@ -2277,6 +2293,27 @@ export class GoogleMeetBotService implements OnModuleDestroy {
   /**
    * Cleanup all bots on module shutdown.
    */
+  /**
+   * Snapshot the live context's storage state and write it back to the auth
+   * file the bot started from. Skipped in guest mode. Never throws.
+   */
+  private async writeBackAuthState(bot: ActiveBot): Promise<void> {
+    if (bot.isGuestMode || !bot.authPath) return;
+    try {
+      const state = await Promise.race([
+        bot.context.storageState(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
+      ]);
+      if (!state) {
+        this.logger.warn('Timed out capturing auth state; keeping existing auth file');
+        return;
+      }
+      this.botAuthService.persistRefreshedState(bot.authPath, state);
+    } catch (err: any) {
+      this.logger.warn(`Could not write back auth state: ${err.message}`);
+    }
+  }
+
   async onModuleDestroy(): Promise<void> {
     const keys = Array.from(this.activeBots.keys());
     await Promise.all(keys.map((key) => this.stopBot(key)));

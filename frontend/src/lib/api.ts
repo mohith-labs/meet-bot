@@ -241,11 +241,20 @@ export interface UpdateSettingsData {
 }
 
 // Bot auth types
+export type BotSessionStatus = "valid" | "expired" | "unknown";
+
 export interface BotAuthStatus {
   isConfigured: boolean;
   method: "upload" | "oauth" | "global" | null;
   lastUpdated: string | null;
   email: string | null;
+  sessionStatus: BotSessionStatus;
+  sessionCheckedAt: string | null;
+}
+
+export interface BotAuthCheckResponse {
+  message: string;
+  status: BotAuthStatus;
 }
 
 export interface BotAuthUploadResponse {
@@ -725,6 +734,12 @@ class ApiClient {
 
   async getBotAuthStatus(): Promise<BotAuthStatus> {
     return this.request<BotAuthStatus>("/settings/bot-auth/status");
+  }
+
+  async checkBotAuthSession(): Promise<BotAuthCheckResponse> {
+    return this.request<BotAuthCheckResponse>("/settings/bot-auth/check", {
+      method: "POST",
+    });
   }
 
   async uploadBotAuth(file: File): Promise<BotAuthUploadResponse> {

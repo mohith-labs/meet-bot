@@ -77,6 +77,24 @@ export class SettingsController {
     return this.botAuthService.getAuthStatus(user.id);
   }
 
+  @Post('bot-auth/check')
+  @ApiOperation({
+    summary: 'Verify the stored Google session is still valid (refreshes cookies on success)',
+  })
+  @ApiResponse({ status: 200, description: 'Returns session status' })
+  async checkBotAuthSession(@CurrentUser() user: any) {
+    const sessionStatus = await this.botAuthService.checkSessionForUser(user.id);
+    return {
+      message:
+        sessionStatus === 'valid'
+          ? 'Google session is valid'
+          : sessionStatus === 'expired'
+            ? 'Google session has expired. Please upload a fresh auth.json.'
+            : 'Could not verify the Google session',
+      status: this.botAuthService.getAuthStatus(user.id),
+    };
+  }
+
   @Post('bot-auth/upload')
   @ApiOperation({ summary: 'Upload auth.json file for bot authentication' })
   @ApiConsumes('multipart/form-data')
