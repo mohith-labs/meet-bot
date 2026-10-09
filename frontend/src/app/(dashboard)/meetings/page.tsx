@@ -287,7 +287,7 @@ export default function MeetingsPage() {
                       >
                         <div className="min-w-0">
                           <p className="text-sm font-medium text-text-primary truncate">
-                            {meeting.data?.botName || "MeetBot"}
+                            {meeting.title || meeting.data?.botName || "MeetBot"}
                           </p>
                           <p className="text-xs text-text-muted truncate">
                             {meeting.nativeMeetingId}

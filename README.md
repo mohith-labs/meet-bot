@@ -30,7 +30,8 @@ MeetBot is a meeting transcription platform that sends real bots to Google Meet 
 - **Real Google Meet bots via Playwright** -- bots join meetings with a real Google account, enable captions, and scrape transcript data in real time
 - **Real-time transcription via WebSocket** -- stream transcript segments as they are captured from Google Meet's built-in captions
 - **Dual authentication** -- protect endpoints with JWT Bearer tokens or API Keys
-- **Webhook notifications** -- receive HTTP callbacks for meeting events (`meeting.started`, `meeting.ended`) with HMAC-SHA256 signing
+- **Webhook notifications** -- receive HTTP callbacks for meeting events (`meeting.started`, `meeting.ended`, `meeting.uploaded`) with HMAC-SHA256 signing
+- **S3 cloud archival** -- automatically upload recordings, transcripts and metadata to any S3-compatible bucket when a meeting ends, organized into readable `date/time_title` folders
 - **Admin panel** -- manage users, toggle registration, and configure app-wide settings
 - **Bot auto-exit** -- configurable automatic exit when the bot is alone in a meeting
 - **Dark-themed dashboard** -- glass-morphism UI with animations built on Next.js
@@ -469,6 +470,8 @@ MeetBot can send HTTP POST requests to your endpoints when meeting events occur.
 |---|---|
 | `meeting.started` | A bot successfully joins a meeting and begins transcribing |
 | `meeting.ended` | A meeting ends or the bot is stopped |
+| `meeting.uploaded` | A meeting's artifacts were successfully archived to S3 |
+| `meeting.upload_failed` | An S3 upload attempt failed |
 | `webhook.test` | Sent when you test a webhook from the dashboard or API |
 
 ### Payload Format
@@ -537,6 +540,83 @@ Admins can:
 ### Registration Toggle
 
 Admins can enable or disable new user registration at any time via the admin settings endpoint or dashboard. When disabled, the `POST /auth/register` endpoint returns a `403` error, and the frontend hides the registration form. The current status is publicly queryable via `GET /auth/registration-status`.
+
+---
+
+## Cloud Storage (S3)
+
+When a meeting ends, MeetBot can automatically upload the recordings, transcripts and a metadata file to any S3-compatible bucket.
+
+Storage is configured **per user** in **Settings → Cloud Storage** (or via the `/storage` API). Nothing is uploaded until a user enables it and saves valid credentials.
+
+### Supported providers
+
+Anything that speaks the S3 API: **AWS S3**, **Cloudflare R2**, **MinIO**, **Backblaze B2**, **Wasabi**, **DigitalOcean Spaces**. Leave the endpoint blank for AWS; set it (and keep path-style URLs on) for everything else.
+
+### Folder organization
+
+Each meeting becomes one folder, named from its date, time and title:
+
+```
+<prefix>/<YYYY-MM-DD>/<HH-mm-ss>_<meeting-title-slug>_<short-id>/
+```
+
+For example:
+
+```
+meetings/2026-10-09/14-45-30_weekly-engineering-sync-q4-review_9f8e7d6c/
+├── video.webm         # screen recording (video + audio)
+├── audio.webm         # audio-only recording
+├── transcript.json    # structured segments with timings
+├── transcript.txt     # plain text, timestamped lines
+├── transcript.vtt     # WebVTT subtitles (plays with the video)
+├── transcript.md      # readable summary with speaker turns
+└── metadata.json      # meeting details, durations, artifact index
+```
+
+- Date and time folders are rendered in the **timezone you configure**, so the bucket reads the way the meeting felt.
+- The meeting title is scraped from the Google Meet page and slugified; meetings without a real title fall back to `untitled-meeting`.
+- The short meeting-id suffix keeps folders unique when two meetings share a title and start second.
+
+### Settings
+
+| Setting | Description |
+|---|---|
+| Endpoint | S3-compatible endpoint URL. Blank for AWS S3. |
+| Bucket / Region | Target bucket and its region. |
+| Access Key ID / Secret | Credentials. The secret is **encrypted at rest** and never returned by the API. |
+| Path-style URLs | Required by MinIO and most non-AWS providers. |
+| Folder prefix | Key prefix inside the bucket (default `meetings`). |
+| Timezone | IANA timezone used for the date/time folder names. |
+| Delete local after upload | Removes local recordings once the upload succeeds, making S3 the source of truth. |
+| Upload failed meetings | Also archive partial data from meetings that ended in a failed state. |
+| Public base URL | Optional CDN base URL included in the `meeting.uploaded` webhook. |
+
+### Behavior
+
+- Uploads run **after** the bot has finished writing its recordings, so no artifact is missed.
+- Large recordings stream to S3 as a **multipart upload**, keeping memory flat.
+- A failed upload retries up to 3 times with exponential backoff, and can be retried manually from the meeting page.
+- Uploads are idempotent -- a meeting already archived is never re-uploaded automatically.
+
+### API
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/storage/config` | Get the current storage configuration (never returns the secret) |
+| `PATCH` | `/storage/config` | Create or update the configuration |
+| `DELETE` | `/storage/config` | Delete the configuration |
+| `POST` | `/storage/config/test` | Test the connection to the bucket |
+| `GET` | `/storage/uploads` | List recent uploads |
+| `GET` | `/storage/uploads/:meetingId` | Get the upload status for one meeting |
+| `POST` | `/storage/uploads/:meetingId/retry` | Retry (or start) an upload |
+| `GET` | `/storage/uploads/:meetingId/download/:artifact` | Get a presigned download URL |
+
+### Security
+
+- Secret access keys are encrypted with **AES-256-GCM**, derived from `JWT_SECRET`.
+- **Changing `JWT_SECRET` invalidates every stored secret key** -- users must re-enter them.
+- Secrets are write-only over the API: responses expose only a masked hint and a `hasSecretAccessKey` flag.
 
 ---
 

@@ -15,6 +15,12 @@ import {
   Monitor,
   Mic,
   Download,
+  Cloud,
+  CloudUpload,
+  CloudOff,
+  RefreshCw,
+  CheckCircle2,
+  AlertCircle,
 } from "lucide-react";
 import { format } from "date-fns";
 import { Button } from "@/components/ui/button";
@@ -29,6 +35,7 @@ import {
   type Meeting,
   type MeetingStatus,
   type TranscriptSegment,
+  type MeetingUpload,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 interface TranscriptEntry {
@@ -321,7 +328,7 @@ export default function MeetingDetailPage() {
         <div>
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-bold text-text-primary">
-              {meeting.data?.botName || "Meeting"}
+              {meeting.title || meeting.data?.botName || "Meeting"}
             </h1>
             <Badge
               variant={statusVariant[meeting.status] || "neutral"}
@@ -448,6 +455,9 @@ export default function MeetingDetailPage() {
 
       {/* Recordings Section */}
       <RecordingsSection meeting={meeting} isLive={isLive} />
+
+      {/* Cloud Archive (S3) */}
+      <CloudArchiveCard meetingId={meetingId} meetingStatus={meeting.status} />
 
       {/* Share URL */}
       {shareUrl && (
@@ -739,6 +749,219 @@ function RecordingsSection({
           </div>
         )}
       </div>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Cloud archive (S3) section — upload status, artifact links, retry
+// ---------------------------------------------------------------------------
+
+/** Human-readable file size. */
+function formatBytes(bytes: number): string {
+  if (!bytes) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+const UPLOAD_BADGE: Record<
+  string,
+  { variant: "success" | "warning" | "error" | "info" | "neutral"; label: string }
+> = {
+  completed: { variant: "success", label: "Archived to S3" },
+  uploading: { variant: "info", label: "Uploading..." },
+  pending: { variant: "warning", label: "Upload pending" },
+  failed: { variant: "error", label: "Upload failed" },
+  skipped: { variant: "neutral", label: "Not archived" },
+  none: { variant: "neutral", label: "Not archived" },
+};
+
+function CloudArchiveCard({
+  meetingId,
+  meetingStatus,
+}: {
+  meetingId: string;
+  meetingStatus: MeetingStatus;
+}) {
+  const [upload, setUpload] = useState<MeetingUpload | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [downloading, setDownloading] = useState<string | null>(null);
+
+  const isFinished = meetingStatus === "completed" || meetingStatus === "failed";
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const data = await api.getUpload(meetingId);
+        if (!cancelled) setUpload(data);
+      } catch {
+        if (!cancelled) setUpload(null);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    load();
+
+    // Poll while an upload is in flight so the badge settles on its own.
+    const interval = setInterval(() => {
+      setUpload((current) => {
+        if (
+          current &&
+          (current.status === "uploading" || current.status === "pending")
+        ) {
+          load();
+        }
+        return current;
+      });
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [meetingId]);
+
+  const handleRetry = async () => {
+    try {
+      setIsRetrying(true);
+      const result = await api.retryUpload(meetingId);
+      setUpload(result.upload);
+      if (result.upload?.status === "completed") {
+        toast.success("Meeting archived to S3");
+      } else if (result.upload?.status === "skipped") {
+        toast(result.upload.lastError || "Upload skipped");
+      } else {
+        toast.error(result.upload?.lastError || "Upload did not complete");
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to retry upload"
+      );
+    } finally {
+      setIsRetrying(false);
+    }
+  };
+
+  const handleDownload = async (artifactName: string) => {
+    try {
+      setDownloading(artifactName);
+      const { url } = await api.getArtifactUrl(meetingId, artifactName);
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Could not create download link"
+      );
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  // Nothing to show for meetings that are still running.
+  if (!isFinished) return null;
+  if (loading) return null;
+
+  const status = upload?.status || "none";
+  const badge = UPLOAD_BADGE[status] || UPLOAD_BADGE.none;
+  const isSkipped = status === "skipped" || status === "none";
+
+  return (
+    <Card padding="sm">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3">
+          {status === "completed" ? (
+            <Cloud className="h-5 w-5 text-green-400" />
+          ) : status === "failed" ? (
+            <CloudOff className="h-5 w-5 text-red-400" />
+          ) : status === "uploading" || status === "pending" ? (
+            <CloudUpload className="h-5 w-5 text-[#6c5ce7] animate-pulse" />
+          ) : (
+            <CloudOff className="h-5 w-5 text-text-muted" />
+          )}
+          <div>
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-medium text-text-primary">
+                Cloud Archive
+              </p>
+              <Badge variant={badge.variant}>{badge.label}</Badge>
+            </div>
+            {status === "completed" && upload?.folderKey && (
+              <p className="text-xs text-text-muted mt-1 font-mono break-all">
+                s3://{upload.bucket}/{upload.folderKey}/
+              </p>
+            )}
+            {isSkipped && (
+              <p className="text-xs text-text-muted mt-1">
+                {upload?.lastError ||
+                  "Configure an S3 bucket in Settings to archive meetings automatically."}
+              </p>
+            )}
+            {status === "failed" && (
+              <p className="text-xs text-red-400 mt-1">
+                {upload?.lastError || "Upload failed"}
+                {upload?.attempts ? ` (attempt ${upload.attempts})` : ""}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {status === "completed" && (
+            <span className="text-xs text-text-muted inline-flex items-center gap-1">
+              <CheckCircle2 className="h-3.5 w-3.5 text-green-400" />
+              {formatBytes(upload?.totalBytes || 0)}
+            </span>
+          )}
+          {status !== "uploading" && (
+            <Button
+              variant="secondary"
+              size="sm"
+              leftIcon={<RefreshCw className="h-4 w-4" />}
+              onClick={handleRetry}
+              isLoading={isRetrying}
+            >
+              {status === "completed" ? "Re-upload" : "Upload now"}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* Archived artifact links */}
+      {status === "completed" && (upload?.artifacts?.length ?? 0) > 0 && (
+        <div className="mt-4 pt-4 border-t border-border">
+          <p className="text-xs font-medium text-text-secondary mb-2">
+            Archived files
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {upload!.artifacts!.map((artifact) => (
+              <button
+                key={artifact.name}
+                onClick={() => handleDownload(artifact.name)}
+                disabled={downloading === artifact.name}
+                className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-bg-secondary border border-border text-xs text-text-secondary hover:border-[#6c5ce7] hover:text-text-primary transition-colors disabled:opacity-50"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span className="font-mono">{artifact.name}</span>
+                <span className="text-text-muted">
+                  {formatBytes(artifact.size)}
+                </span>
+              </button>
+            ))}
+          </div>
+          {upload?.localFilesDeleted && (
+            <p className="text-xs text-text-muted mt-3 inline-flex items-center gap-1.5">
+              <AlertCircle className="h-3.5 w-3.5" />
+              Local copies were deleted after upload — S3 is the source of truth.
+            </p>
+          )}
+        </div>
+      )}
     </Card>
   );
 }

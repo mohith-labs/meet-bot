@@ -12,6 +12,7 @@ import { WebSocketModule } from '../websocket/websocket.module';
 import { WebhooksModule } from '../webhooks/webhooks.module';
 import { UsersModule } from '../users/users.module';
 import { SettingsModule } from '../settings/settings.module';
+import { StorageModule } from '../storage/storage.module';
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { SettingsModule } from '../settings/settings.module';
     WebhooksModule,
     UsersModule,
     SettingsModule,
+    StorageModule,
   ],
   providers: [BotsService, GoogleMeetBotService, RecordingCleanupService],
   controllers: [BotsController],

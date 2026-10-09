@@ -26,6 +26,7 @@ export interface BotEvents {
   on(event: 'status', listener: (status: string) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
   on(event: 'ended', listener: () => void): this;
+  on(event: 'title', listener: (title: string) => void): this;
 }
 
 interface ActiveBot {
@@ -417,6 +418,19 @@ export class GoogleMeetBotService implements OnModuleDestroy {
 
     emitter.emit('status', 'active');
     this.logger.log('Successfully joined the meeting!');
+
+    // Step 8b: Detect the human-readable meeting title (best effort — used for
+    // readable S3 folder names). Never let this block the meeting flow.
+    this.detectMeetingTitle(page)
+      .then((title) => {
+        if (title) {
+          this.logger.log(`Detected meeting title: "${title}"`);
+          emitter.emit('title', title);
+        }
+      })
+      .catch((error) =>
+        this.logger.debug(`Title detection failed: ${error.message}`),
+      );
 
     // Step 9: Enable captions via Shift+C
     await this.enableCaptions(page);
@@ -870,6 +884,80 @@ export class GoogleMeetBotService implements OnModuleDestroy {
   // ---------------------------------------------------------------------------
   // Join button (Recall.ai approach: try multiple button texts)
   // ---------------------------------------------------------------------------
+
+  /**
+   * Best-effort detection of the human-readable meeting title.
+   *
+   * Google Meet exposes the title in several places depending on how the call
+   * was created (Calendar event vs. instant meeting). We try, in order:
+   *   1. The in-call meeting-details heading
+   *   2. The document title (minus the "Meet - " / " - Google Meet" chrome)
+   * A title equal to the meeting code (e.g. "abc-defg-hij") is treated as
+   * "no real title" so the caller can fall back to the meeting ID.
+   */
+  private async detectMeetingTitle(page: Page): Promise<string | null> {
+    try {
+      const raw = await page.evaluate(() => {
+        const clean = (value: string | null | undefined): string =>
+          (value || '').replace(/\s+/g, ' ').trim();
+
+        // 1. In-call meeting details / heading elements
+        const selectors = [
+          '[data-meeting-title]',
+          '[data-call-title]',
+          'div[jsname="r4nke"]',
+          '[role="heading"][aria-level="1"]',
+          'h1',
+        ];
+
+        for (const selector of selectors) {
+          const el = document.querySelector(selector);
+          if (!el) continue;
+
+          const attr =
+            el.getAttribute('data-meeting-title') ||
+            el.getAttribute('data-call-title');
+          const value = clean(attr || (el as HTMLElement).innerText);
+
+          if (value && value.length > 1 && value.length < 200) {
+            return value;
+          }
+        }
+
+        // 2. Fall back to the document title
+        return clean(document.title);
+      });
+
+      return this.normalizeTitle(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Strip Google Meet chrome from a raw title and reject non-titles
+   * (meeting codes, generic app names).
+   */
+  private normalizeTitle(raw: string | null): string | null {
+    if (!raw) return null;
+
+    let title = raw
+      .replace(/\s*[-—|]\s*Google Meet\s*$/i, '')
+      .replace(/^\s*Meet\s*[-—|]\s*/i, '')
+      .replace(/^\s*Google Meet\s*[-—|]\s*/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!title) return null;
+
+    // A bare meeting code (abc-defg-hij) is not a useful title.
+    if (/^[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(title)) return null;
+
+    const generic = ['meet', 'google meet', 'meeting', 'untitled'];
+    if (generic.includes(title.toLowerCase())) return null;
+
+    return title.slice(0, 200);
+  }
 
   private async clickJoinButton(page: Page): Promise<void> {
     const joinTexts = [

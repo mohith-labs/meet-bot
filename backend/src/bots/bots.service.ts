@@ -26,6 +26,7 @@ import { WebhookDispatcherService } from '../webhooks/webhook-dispatcher.service
 import { UsersService } from '../users/users.service';
 import { BotAuthService } from '../settings/bot-auth.service';
 import { resolveStoragePath, getRecordingDir } from '../config/storage.config';
+import { MeetingUploaderService } from '../storage/meeting-uploader.service';
 
 @Injectable()
 export class BotsService {
@@ -61,6 +62,7 @@ export class BotsService {
     private readonly webhookDispatcher: WebhookDispatcherService,
     private readonly usersService: UsersService,
     private readonly botAuthService: BotAuthService,
+    private readonly meetingUploader: MeetingUploaderService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -190,6 +192,18 @@ export class BotsService {
     // ── Caption events ─────────────────────────────────────────────
     emitter.on('caption', async (caption: CaptionEvent) => {
       await this.handleCaptionEvent(meetingId, meetingKey, caption);
+    });
+
+    // ── Meeting title detected ─────────────────────────────────────
+    emitter.on('title', async (title: string) => {
+      try {
+        await this.meetingsRepository.update(meetingId, { title });
+        this.logger.log(`Saved title for ${meetingId}: "${title}"`);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to save title for ${meetingId}: ${error.message}`,
+        );
+      }
     });
 
     // ── Meeting ended naturally ────────────────────────────────────
@@ -425,6 +439,9 @@ export class BotsService {
 
       this.meetingStartTimes.delete(meetingId);
       this.broadcastStatus(meetingId, meetingKey, MeetingStatus.COMPLETED);
+
+      // Archive to S3 once the bot has written its recordings (fire-and-forget)
+      void this.archiveMeeting(meetingId);
     } catch (error) {
       this.logger.error(
         `Error handling meeting ended for ${meetingId}: ${error.message}`,
@@ -548,6 +565,10 @@ export class BotsService {
     this.broadcastStatus(meeting.id, meetingKey, MeetingStatus.COMPLETED);
 
     this.logger.log(`Bot stopped for meeting ${platform}/${nativeMeetingId}`);
+
+    // Archive to S3 — the browser is already stopped at this point, so the
+    // uploader's bot-stopped wait resolves immediately.
+    void this.archiveMeeting(meeting.id);
 
     return meeting;
   }
@@ -791,6 +812,54 @@ export class BotsService {
   // Private helpers
   // ---------------------------------------------------------------------------
 
+  // ---------------------------------------------------------------------------
+  // S3 archival
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Trigger the S3 archive for a finished meeting.
+   *
+   * Recording files are written by GoogleMeetBotService.stopBot(), which may
+   * still be running when the meeting-ended handler fires. Uploading too early
+   * would archive a meeting without its video/audio, so we wait for the bot to
+   * fully stop (bounded) before handing off to the uploader.
+   */
+  private async archiveMeeting(meetingId: string): Promise<void> {
+    try {
+      await this.waitForBotStopped(meetingId);
+      this.meetingUploader.queueUpload(meetingId);
+    } catch (error) {
+      this.logger.error(
+        `Failed to start archive for meeting ${meetingId}: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Poll until the Playwright bot has released the meeting (recordings flushed
+   * to disk), or until the timeout expires.
+   */
+  private async waitForBotStopped(
+    meetingId: string,
+    timeoutMs = 120_000,
+    pollMs = 1_000,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (!this.googleMeetBotService.isRunning(meetingId)) {
+        // Give the recordings_saved listener a moment to persist the paths.
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+
+    this.logger.warn(
+      `Bot for ${meetingId} still running after ${timeoutMs / 1000}s — archiving anyway`,
+    );
+  }
+
   private async setMeetingStatus(
     meetingId: string,
     meetingKey: string,
@@ -808,6 +877,12 @@ export class BotsService {
       }
       await this.meetingsRepository.update(meetingId, update);
       this.broadcastStatus(meetingId, meetingKey, status);
+
+      // A FAILED meeting may still have partial recordings/transcripts worth
+      // keeping; the uploader honours the user's uploadOnFailed preference.
+      if (status === MeetingStatus.FAILED) {
+        void this.archiveMeeting(meetingId);
+      }
     } catch (error) {
       this.logger.error(
         `Failed to update meeting status for ${meetingId}: ${error.message}`,

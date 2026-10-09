@@ -74,6 +74,7 @@ backend/src/
   webhooks/              # Webhook CRUD + dispatcher
   api-keys/              # API key management
   settings/              # User settings
+  storage/               # S3-compatible archival (config, uploader, object keys)
   users/                 # User CRUD
   websocket/             # Socket.IO transcript gateway
 
@@ -177,4 +178,5 @@ export function MyComponent({ title, onAction }: MyComponentProps) {
 - Copy `.env.example` -> `.env` (backend) and `.env.local.example` -> `.env.local` (frontend).
 - Never commit `.env`, `.env.local`, `auth.json`, `.data/`, or `*.sqlite` files.
 - Required backend vars: `JWT_SECRET`, `PORT`, `DB_PATH`, `FRONTEND_URL`.
+- S3 archival is configured per-user in the dashboard, not via env vars. Secret keys are encrypted with AES-256-GCM derived from `JWT_SECRET`, so changing `JWT_SECRET` invalidates all stored S3 secrets.
 - Required frontend vars: `NEXT_PUBLIC_API_URL`.
