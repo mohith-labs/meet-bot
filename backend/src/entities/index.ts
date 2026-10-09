@@ -4,3 +4,9 @@ export { TranscriptSegment } from './transcript-segment.entity';
 export { ApiKey } from './api-key.entity';
 export { Webhook } from './webhook.entity';
 export { AppSettings } from './app-settings.entity';
+export { StorageConfig } from './storage-config.entity';
+export {
+  MeetingUpload,
+  UploadStatus,
+  UploadedArtifact,
+} from './meeting-upload.entity';

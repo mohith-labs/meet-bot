@@ -31,6 +31,12 @@ import {
   CheckCircle2,
   XCircle,
   Globe,
+  Cloud,
+  CloudUpload,
+  Database,
+  Eye,
+  EyeOff,
+  RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -48,11 +54,68 @@ import {
   type AdminUser,
   type AdminAppSettings,
   type BotAuthStatus,
+  type StorageConfig,
+  type UpdateStorageConfigData,
 } from "@/lib/api";
 import toast from "react-hot-toast";
 
 // ─── Available webhook events ───────────────────────────────────────────────
-const WEBHOOK_EVENTS = ["meeting.started", "meeting.ended"] as const;
+const WEBHOOK_EVENTS = [
+  "meeting.started",
+  "meeting.ended",
+  "meeting.uploaded",
+  "meeting.upload_failed",
+] as const;
+
+// ─── S3 storage form state ──────────────────────────────────────────────────
+interface StorageFormState {
+  isEnabled: boolean;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  forcePathStyle: boolean;
+  prefix: string;
+  timezone: string;
+  deleteLocalAfterUpload: boolean;
+  uploadOnFailed: boolean;
+  publicBaseUrl: string;
+}
+
+const defaultStorageForm: StorageFormState = {
+  isEnabled: false,
+  endpoint: "",
+  region: "us-east-1",
+  bucket: "",
+  accessKeyId: "",
+  secretAccessKey: "",
+  forcePathStyle: true,
+  prefix: "meetings",
+  timezone:
+    typeof Intl !== "undefined"
+      ? Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+      : "UTC",
+  deleteLocalAfterUpload: true,
+  uploadOnFailed: true,
+  publicBaseUrl: "",
+};
+
+// Quick-fill presets for common S3-compatible providers
+const STORAGE_PRESETS = [
+  { label: "AWS S3", endpoint: "", forcePathStyle: false },
+  {
+    label: "Cloudflare R2",
+    endpoint: "https://<account-id>.r2.cloudflarestorage.com",
+    forcePathStyle: true,
+  },
+  { label: "MinIO", endpoint: "http://localhost:9000", forcePathStyle: true },
+  {
+    label: "Backblaze B2",
+    endpoint: "https://s3.us-west-002.backblazeb2.com",
+    forcePathStyle: true,
+  },
+] as const;
 
 // ─── Webhook Form State ─────────────────────────────────────────────────────
 interface WebhookFormState {
@@ -110,6 +173,18 @@ export default function SettingsPage() {
   const [isSavingWebhook, setIsSavingWebhook] = useState(false);
   const [testingWebhookId, setTestingWebhookId] = useState<string | null>(null);
   const [deletingWebhookId, setDeletingWebhookId] = useState<string | null>(null);
+
+  // ── S3 storage state ─────────────────────────────────────────────────────
+  const [storageConfig, setStorageConfig] = useState<StorageConfig | null>(null);
+  const [storageForm, setStorageForm] = useState<StorageFormState>(defaultStorageForm);
+  const [isLoadingStorage, setIsLoadingStorage] = useState(true);
+  const [isSavingStorage, setIsSavingStorage] = useState(false);
+  const [isTestingStorage, setIsTestingStorage] = useState(false);
+  const [storageTestResult, setStorageTestResult] = useState<{
+    success: boolean;
+    error?: string;
+  } | null>(null);
+  const [showSecret, setShowSecret] = useState(false);
 
   // ── Bot auth state ───────────────────────────────────────────────────────
   const [botAuthStatus, setBotAuthStatus] = useState<BotAuthStatus | null>(null);
@@ -187,6 +262,121 @@ export default function SettingsPage() {
   }, [isAdmin]);
 
   // ── Load bot auth status ────────────────────────────────────────────────
+  const loadStorageConfig = useCallback(async () => {
+    try {
+      setIsLoadingStorage(true);
+      const data = await api.getStorageConfig();
+      setStorageConfig(data);
+      setStorageForm({
+        isEnabled: data.isEnabled,
+        endpoint: data.endpoint,
+        region: data.region,
+        bucket: data.bucket,
+        accessKeyId: data.accessKeyId,
+        // Never pre-fill the secret — an empty value keeps the stored one.
+        secretAccessKey: "",
+        forcePathStyle: data.forcePathStyle,
+        prefix: data.prefix,
+        timezone:
+          data.timezone ||
+          Intl.DateTimeFormat().resolvedOptions().timeZone ||
+          "UTC",
+        deleteLocalAfterUpload: data.deleteLocalAfterUpload,
+        uploadOnFailed: data.uploadOnFailed,
+        publicBaseUrl: data.publicBaseUrl,
+      });
+      if (data.lastTestError) {
+        setStorageTestResult({ success: false, error: data.lastTestError });
+      } else if (data.lastTestedAt) {
+        setStorageTestResult({ success: true });
+      }
+    } catch (error) {
+      console.error("Failed to load storage config:", error);
+    } finally {
+      setIsLoadingStorage(false);
+    }
+  }, []);
+
+  const buildStoragePayload = useCallback((): UpdateStorageConfigData => {
+    const payload: UpdateStorageConfigData = {
+      isEnabled: storageForm.isEnabled,
+      endpoint: storageForm.endpoint.trim(),
+      region: storageForm.region.trim() || "us-east-1",
+      bucket: storageForm.bucket.trim(),
+      accessKeyId: storageForm.accessKeyId.trim(),
+      forcePathStyle: storageForm.forcePathStyle,
+      prefix: storageForm.prefix.trim(),
+      timezone: storageForm.timezone.trim() || "UTC",
+      deleteLocalAfterUpload: storageForm.deleteLocalAfterUpload,
+      uploadOnFailed: storageForm.uploadOnFailed,
+      publicBaseUrl: storageForm.publicBaseUrl.trim(),
+    };
+    // Only send the secret when the user actually typed a new one.
+    if (storageForm.secretAccessKey) {
+      payload.secretAccessKey = storageForm.secretAccessKey;
+    }
+    return payload;
+  }, [storageForm]);
+
+  const handleSaveStorage = async (e: FormEvent) => {
+    e.preventDefault();
+
+    if (storageForm.isEnabled) {
+      const hasSecret =
+        !!storageForm.secretAccessKey || !!storageConfig?.hasSecretAccessKey;
+      if (!storageForm.bucket.trim() || !storageForm.accessKeyId.trim() || !hasSecret) {
+        toast.error(
+          "Bucket, access key ID and secret access key are required to enable uploads"
+        );
+        return;
+      }
+    }
+
+    try {
+      setIsSavingStorage(true);
+      const result = await api.updateStorageConfig(buildStoragePayload());
+      setStorageConfig(result.config);
+      setStorageForm((prev) => ({ ...prev, secretAccessKey: "" }));
+      toast.success("Storage settings saved");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to save storage settings"
+      );
+    } finally {
+      setIsSavingStorage(false);
+    }
+  };
+
+  const handleTestStorage = async () => {
+    try {
+      setIsTestingStorage(true);
+      setStorageTestResult(null);
+      const result = await api.testStorageConnection(buildStoragePayload());
+      setStorageTestResult(result);
+      if (result.success) {
+        toast.success("Connected to the bucket successfully");
+      } else {
+        toast.error(result.error || "Connection failed");
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Connection test failed";
+      setStorageTestResult({ success: false, error: message });
+      toast.error(message);
+    } finally {
+      setIsTestingStorage(false);
+    }
+  };
+
+  const applyStoragePreset = (preset: (typeof STORAGE_PRESETS)[number]) => {
+    setStorageForm((prev) => ({
+      ...prev,
+      endpoint: preset.endpoint,
+      forcePathStyle: preset.forcePathStyle,
+    }));
+    setStorageTestResult(null);
+  };
+
   const loadBotAuthStatus = useCallback(async () => {
     setIsLoadingBotAuth(true);
     try {
@@ -207,6 +397,7 @@ export default function SettingsPage() {
     loadSettings();
     loadWebhooks();
     loadBotAuthStatus();
+    loadStorageConfig();
     if (isAdmin) {
       loadAdminUsers();
       loadAdminSettings();
@@ -1007,6 +1198,351 @@ export default function SettingsPage() {
                 isLoading={isSavingSettings}
               >
                 Save Settings
+              </Button>
+            </div>
+          </form>
+        )}
+      </Card>
+
+      {/* ── Cloud Storage (S3) Section ──────────────────────────────────── */}
+      <Card>
+        <CardHeader>
+          <div>
+            <CardTitle>
+              <span className="inline-flex items-center gap-2">
+                <Cloud className="h-5 w-5 text-[#6c5ce7]" />
+                Cloud Storage (S3)
+              </span>
+            </CardTitle>
+            <CardDescription>
+              Automatically upload recordings, transcripts and metadata to an
+              S3-compatible bucket when a meeting ends
+            </CardDescription>
+          </div>
+          {storageConfig?.isEnabled && storageConfig?.isConfigured && (
+            <Badge variant="success">Active</Badge>
+          )}
+        </CardHeader>
+
+        {isLoadingStorage ? (
+          <div className="flex items-center justify-center py-8">
+            <div className="h-6 w-6 border-2 border-[#6c5ce7] border-t-transparent rounded-full animate-spin" />
+          </div>
+        ) : (
+          <form onSubmit={handleSaveStorage} className="space-y-4">
+            {/* Enable toggle */}
+            <div className="flex items-center justify-between p-4 rounded-lg border border-[#2a2a3e] bg-[#16162a]">
+              <div className="flex-1">
+                <div className="flex items-center gap-2">
+                  <CloudUpload className="h-4 w-4 text-[#6c5ce7]" />
+                  <p className="text-sm font-medium text-[#e4e4f0]">
+                    Upload meetings to S3
+                  </p>
+                </div>
+                <p className="text-xs text-text-secondary mt-1 ml-6">
+                  Files are organised as{" "}
+                  <code className="text-[#6c5ce7]">
+                    {storageForm.prefix || "meetings"}/YYYY-MM-DD/HH-mm-ss_meeting-title_id/
+                  </code>
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={storageForm.isEnabled}
+                onClick={() =>
+                  setStorageForm({
+                    ...storageForm,
+                    isEnabled: !storageForm.isEnabled,
+                  })
+                }
+                className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-[#6c5ce7] focus:ring-offset-2 focus:ring-offset-[#16162a] ${
+                  storageForm.isEnabled ? "bg-[#6c5ce7]" : "bg-[#2a2a3e]"
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                    storageForm.isEnabled ? "translate-x-5" : "translate-x-0"
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Provider presets */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-text-muted">Quick setup:</span>
+              {STORAGE_PRESETS.map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  onClick={() => applyStoragePreset(preset)}
+                  className="px-2.5 py-1 text-xs rounded-md border border-[#2a2a3e] bg-[#16162a] text-text-secondary hover:border-[#6c5ce7] hover:text-[#e4e4f0] transition-colors"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Connection fields */}
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="sm:col-span-2">
+                <label className="block text-sm font-medium text-text-secondary mb-1.5">
+                  Endpoint URL
+                </label>
+                <Input
+                  value={storageForm.endpoint}
+                  onChange={(e) =>
+                    setStorageForm({ ...storageForm, endpoint: e.target.value })
+                  }
+                  placeholder="Leave empty for AWS S3"
+                />
+                <p className="mt-1.5 text-xs text-text-muted">
+                  Required for R2, MinIO, Backblaze, Wasabi and other
+                  S3-compatible providers
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-1.5">
+                  Bucket <span className="text-red-400">*</span>
+                </label>
+                <Input
+                  value={storageForm.bucket}
+                  onChange={(e) =>
+                    setStorageForm({ ...storageForm, bucket: e.target.value })
+                  }
+                  placeholder="meeting-archives"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-1.5">
+                  Region
+                </label>
+                <Input
+                  value={storageForm.region}
+                  onChange={(e) =>
+                    setStorageForm({ ...storageForm, region: e.target.value })
+                  }
+                  placeholder="us-east-1"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-1.5">
+                  Access Key ID <span className="text-red-400">*</span>
+                </label>
+                <Input
+                  value={storageForm.accessKeyId}
+                  onChange={(e) =>
+                    setStorageForm({
+                      ...storageForm,
+                      accessKeyId: e.target.value,
+                    })
+                  }
+                  placeholder="AKIA..."
+                  autoComplete="off"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-1.5">
+                  Secret Access Key{" "}
+                  {!storageConfig?.hasSecretAccessKey && (
+                    <span className="text-red-400">*</span>
+                  )}
+                </label>
+                <div className="relative">
+                  <Input
+                    type={showSecret ? "text" : "password"}
+                    value={storageForm.secretAccessKey}
+                    onChange={(e) =>
+                      setStorageForm({
+                        ...storageForm,
+                        secretAccessKey: e.target.value,
+                      })
+                    }
+                    placeholder={
+                      storageConfig?.hasSecretAccessKey
+                        ? `${storageConfig.secretAccessKeyMasked} (unchanged)`
+                        : "Enter secret access key"
+                    }
+                    autoComplete="new-password"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowSecret(!showSecret)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-primary"
+                    aria-label={showSecret ? "Hide secret" : "Show secret"}
+                  >
+                    {showSecret ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
+                <p className="mt-1.5 text-xs text-text-muted">
+                  Stored encrypted. Leave blank to keep the current key.
+                </p>
+              </div>
+            </div>
+
+            {/* Organisation fields */}
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-1.5">
+                  Folder prefix
+                </label>
+                <Input
+                  value={storageForm.prefix}
+                  onChange={(e) =>
+                    setStorageForm({ ...storageForm, prefix: e.target.value })
+                  }
+                  placeholder="meetings"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-1.5">
+                  Timezone for folder names
+                </label>
+                <Input
+                  value={storageForm.timezone}
+                  onChange={(e) =>
+                    setStorageForm({ ...storageForm, timezone: e.target.value })
+                  }
+                  placeholder="Asia/Kolkata"
+                />
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block text-sm font-medium text-text-secondary mb-1.5">
+                  Public base URL (optional)
+                </label>
+                <Input
+                  value={storageForm.publicBaseUrl}
+                  onChange={(e) =>
+                    setStorageForm({
+                      ...storageForm,
+                      publicBaseUrl: e.target.value,
+                    })
+                  }
+                  placeholder="https://cdn.example.com/meetings"
+                />
+              </div>
+            </div>
+
+            {/* Behaviour toggles */}
+            <div className="space-y-2">
+              {[
+                {
+                  key: "forcePathStyle" as const,
+                  label: "Use path-style URLs",
+                  hint: "Required by MinIO and most non-AWS providers",
+                },
+                {
+                  key: "deleteLocalAfterUpload" as const,
+                  label: "Delete local files after upload",
+                  hint: "S3 becomes the source of truth and local disk stays clean",
+                },
+                {
+                  key: "uploadOnFailed" as const,
+                  label: "Upload failed meetings too",
+                  hint: "Archives partial recordings and transcripts when a meeting fails",
+                },
+              ].map((option) => (
+                <label
+                  key={option.key}
+                  className="flex items-start gap-3 p-3 rounded-lg border border-[#2a2a3e] bg-[#16162a] cursor-pointer hover:border-[#6c5ce7]/50 transition-colors"
+                >
+                  <input
+                    type="checkbox"
+                    checked={storageForm[option.key]}
+                    onChange={(e) =>
+                      setStorageForm({
+                        ...storageForm,
+                        [option.key]: e.target.checked,
+                      })
+                    }
+                    className="mt-0.5 h-4 w-4 rounded border-[#2a2a3e] bg-[#0f0f1e] text-[#6c5ce7] focus:ring-[#6c5ce7]"
+                  />
+                  <span>
+                    <span className="block text-sm text-[#e4e4f0]">
+                      {option.label}
+                    </span>
+                    <span className="block text-xs text-text-muted mt-0.5">
+                      {option.hint}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+
+            {/* Connection test result */}
+            {storageTestResult && (
+              <div
+                className={`flex items-start gap-2 p-3 rounded-lg border text-sm ${
+                  storageTestResult.success
+                    ? "border-green-500/30 bg-green-500/10 text-green-400"
+                    : "border-red-500/30 bg-red-500/10 text-red-400"
+                }`}
+              >
+                {storageTestResult.success ? (
+                  <CheckCircle2 className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                ) : (
+                  <XCircle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                )}
+                <span>
+                  {storageTestResult.success
+                    ? "Connection successful — the bucket is reachable and writable."
+                    : storageTestResult.error}
+                </span>
+              </div>
+            )}
+
+            {/* What gets uploaded */}
+            <div className="p-3 rounded-lg border border-[#2a2a3e] bg-[#16162a]">
+              <p className="text-xs font-medium text-text-secondary mb-2 inline-flex items-center gap-1.5">
+                <Database className="h-3.5 w-3.5" />
+                Each meeting folder contains
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  "video.webm",
+                  "audio.webm",
+                  "transcript.json",
+                  "transcript.txt",
+                  "transcript.vtt",
+                  "transcript.md",
+                  "metadata.json",
+                ].map((file) => (
+                  <code
+                    key={file}
+                    className="px-2 py-0.5 text-xs rounded bg-[#0f0f1e] border border-[#2a2a3e] text-text-secondary"
+                  >
+                    {file}
+                  </code>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                type="button"
+                variant="secondary"
+                leftIcon={<TestTube2 className="h-4 w-4" />}
+                isLoading={isTestingStorage}
+                onClick={handleTestStorage}
+              >
+                Test Connection
+              </Button>
+              <Button
+                type="submit"
+                leftIcon={<Save className="h-4 w-4" />}
+                isLoading={isSavingStorage}
+              >
+                Save Storage Settings
               </Button>
             </div>
           </form>

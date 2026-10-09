@@ -32,7 +32,7 @@ export class CreateWebhookDto {
 
   @ApiProperty({
     required: false,
-    example: ['meeting.started', 'meeting.ended'],
+    example: ['meeting.started', 'meeting.ended', 'meeting.uploaded'],
   })
   @IsOptional()
   @IsArray()

@@ -35,6 +35,7 @@ export interface Meeting {
   platform: MeetingPlatform;
   nativeMeetingId: string;
   constructedMeetingUrl: string;
+  title: string | null;
   status: MeetingStatus;
   botContainerId: string | null;
   startTime: string | null;
@@ -107,6 +108,7 @@ export interface MeetingDetail {
   platform: MeetingPlatform;
   nativeMeetingId: string;
   constructedMeetingUrl: string;
+  title: string | null;
   status: MeetingStatus;
   botContainerId: string | null;
   startTime: string | null;
@@ -269,6 +271,86 @@ export interface OAuthCallbackResponse {
   message: string;
   email: string;
   status: BotAuthStatus;
+}
+
+// ─── Storage (S3) types ─────────────────────────────────────────────────────
+
+export interface StorageConfig {
+  isEnabled: boolean;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  accessKeyId: string;
+  hasSecretAccessKey: boolean;
+  secretAccessKeyMasked: string;
+  forcePathStyle: boolean;
+  prefix: string;
+  timezone: string;
+  deleteLocalAfterUpload: boolean;
+  uploadOnFailed: boolean;
+  publicBaseUrl: string;
+  isConfigured: boolean;
+  lastTestedAt: string | null;
+  lastTestError: string | null;
+}
+
+export interface UpdateStorageConfigData {
+  isEnabled?: boolean;
+  endpoint?: string;
+  region?: string;
+  bucket?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  forcePathStyle?: boolean;
+  prefix?: string;
+  timezone?: string;
+  deleteLocalAfterUpload?: boolean;
+  uploadOnFailed?: boolean;
+  publicBaseUrl?: string;
+}
+
+export interface StorageTestResult {
+  success: boolean;
+  error?: string;
+}
+
+export type UploadStatus =
+  | "pending"
+  | "uploading"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "none";
+
+export interface UploadedArtifact {
+  name: string;
+  key: string;
+  size: number;
+  contentType: string;
+}
+
+export interface MeetingUpload {
+  id?: string;
+  meetingId: string;
+  userId?: string;
+  status: UploadStatus;
+  bucket?: string;
+  folderKey?: string;
+  artifacts?: UploadedArtifact[];
+  totalBytes?: number;
+  attempts?: number;
+  lastError?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  localFilesDeleted?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ArtifactUrlResponse {
+  url: string;
+  key: string;
+  expiresIn: number;
 }
 
 // ─── Admin types ────────────────────────────────────────────────────────────
@@ -575,6 +657,68 @@ class ApiClient {
       method: "PATCH",
       body: JSON.stringify(data),
     });
+  }
+
+  // ── Storage (S3) ──────────────────────────────────────────────────────────
+
+  async getStorageConfig(): Promise<StorageConfig> {
+    return this.request<StorageConfig>("/storage/config");
+  }
+
+  async updateStorageConfig(
+    data: UpdateStorageConfigData
+  ): Promise<{ message: string; config: StorageConfig }> {
+    return this.request<{ message: string; config: StorageConfig }>(
+      "/storage/config",
+      {
+        method: "PATCH",
+        body: JSON.stringify(data),
+      }
+    );
+  }
+
+  async deleteStorageConfig(): Promise<{ message: string }> {
+    return this.request<{ message: string }>("/storage/config", {
+      method: "DELETE",
+    });
+  }
+
+  async testStorageConnection(
+    data: UpdateStorageConfigData = {}
+  ): Promise<StorageTestResult> {
+    return this.request<StorageTestResult>("/storage/config/test", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async listUploads(limit = 50): Promise<MeetingUpload[]> {
+    return this.request<MeetingUpload[]>(`/storage/uploads?limit=${limit}`);
+  }
+
+  async getUpload(meetingId: string): Promise<MeetingUpload> {
+    return this.request<MeetingUpload>(`/storage/uploads/${meetingId}`);
+  }
+
+  async retryUpload(
+    meetingId: string
+  ): Promise<{ message: string; upload: MeetingUpload }> {
+    return this.request<{ message: string; upload: MeetingUpload }>(
+      `/storage/uploads/${meetingId}/retry`,
+      { method: "POST" }
+    );
+  }
+
+  async getArtifactUrl(
+    meetingId: string,
+    artifact: string,
+    expiresIn = 3600
+  ): Promise<ArtifactUrlResponse> {
+    return this.request<ArtifactUrlResponse>(
+      `/storage/uploads/${meetingId}/download/${encodeURIComponent(
+        artifact
+      )}?expiresIn=${expiresIn}`
+    );
   }
 
   // ── Bot Auth ───────────────────────────────────────────────────────────────

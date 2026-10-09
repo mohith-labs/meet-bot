@@ -45,6 +45,14 @@ export class Meeting {
   @Column({ nullable: true })
   constructedMeetingUrl: string;
 
+  /**
+   * Human-readable meeting title scraped from the Google Meet page
+   * (falls back to null when it could not be detected).
+   * Used to build readable S3 folder names.
+   */
+  @Column({ nullable: true })
+  title: string;
+
   @Column({
     type: 'varchar',
     default: MeetingStatus.REQUESTED,
